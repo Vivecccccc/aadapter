@@ -14,6 +14,16 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 	var authCalls int32
 	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&authCalls, 1)
+		var payload map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode auth payload: %v", err)
+		}
+		if _, ok := payload["userid"]; !ok {
+			t.Fatalf("missing userid field: %#v", payload)
+		}
+		if _, bad := payload["user_id"]; bad {
+			t.Fatalf("unexpected user_id field: %#v", payload)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"id_token":   "tok1",
 			"expires_in": 3600,

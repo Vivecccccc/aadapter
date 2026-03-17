@@ -28,6 +28,17 @@ A high-performance Go adapter that accepts Anthropic-compatible `/v1/messages` r
 - `GATEWAY_TIMEOUT` (default `120s`)
 - `FORCE_REFRESH_ON_401_403` (default `true`)
 
+## Base URL composition
+`GATEWAY_BASE_URL` should be only your gateway origin (and optional fixed prefix), for example:
+- `https://gateway.example.com`
+- `https://gateway.example.com/proxy`
+
+Do **not** append the Vertex route suffix yourself. The adapter appends:
+`/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{rawPredict|streamRawPredict}`
+
+So if `GATEWAY_BASE_URL=https://gateway.example.com`, final forwarded URL is like:
+`https://gateway.example.com/v1/projects/...:rawPredict`
+
 ## Local development
 ```bash
 go run .

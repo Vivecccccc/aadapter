@@ -24,7 +24,7 @@ type tokenProvider struct {
 }
 
 type authRequest struct {
-	UserID   string `json:"user_id"`
+	UserID   string `json:"userid"`
 	Password string `json:"password"`
 	OTP      string `json:"otp"`
 	OTPType  string `json:"otp_type"`
