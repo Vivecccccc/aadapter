@@ -28,6 +28,31 @@ A high-performance Go adapter that accepts Anthropic-compatible `/v1/messages` r
 - `GATEWAY_TIMEOUT` (default `120s`)
 - `FORCE_REFRESH_ON_401_403` (default `true`)
 
+## Logging controls (`--verbose`, `--log-level`)
+You can control runtime logs with CLI flags:
+
+```bash
+go run . --log-level=info
+go run . --log-level=warning
+go run . --log-level=error
+go run . --log-level=debug
+go run . --verbose
+```
+
+Rules:
+- `--verbose` forces debug logging (same effect as `--log-level=debug`).
+- `--log-level` controls minimum severity: `debug`, `info`, `warning`, `error`.
+
+Message logging behavior:
+- `debug`: logs full inbound `/v1/messages` request JSON and full upstream response body JSON (or full stream payload) without truncation, plus headers (Authorization redacted).
+- `info`: one-line per request summary (method/path/model/stream) and completion summary (status/bytes/duration/target).
+- `warning`: warning/error only (e.g. invalid request, 4xx, token refresh retry).
+- `error`: only failures (e.g. token retrieval failure, upstream call failure, 5xx paths).
+
+Env alternatives are also supported:
+- `ADAPTER_VERBOSE=true`
+- `ADAPTER_LOG_LEVEL=debug|info|warning|error`
+
 ## Base URL composition
 `GATEWAY_BASE_URL` should be only your gateway origin (and optional fixed prefix), for example:
 - `https://gateway.example.com`
@@ -38,6 +63,21 @@ Do **not** append the Vertex route suffix yourself. The adapter appends:
 
 So if `GATEWAY_BASE_URL=https://gateway.example.com`, final forwarded URL is like:
 `https://gateway.example.com/v1/projects/...:rawPredict`
+
+## Claude Messages vs Vertex Claude rawPredict compatibility
+For Anthropic-native Messages API (`POST /v1/messages`), requests commonly include:
+- body field `model`
+- required headers `x-api-key` and `anthropic-version`
+
+For Vertex Claude (`rawPredict`/`streamRawPredict`), Google samples show:
+- model selected in URL path `/publishers/anthropic/models/{MODEL}:rawPredict` (or `:streamRawPredict`)
+- body field `anthropic_version` (e.g. `vertex-2023-10-16`)
+- auth via `Authorization: Bearer ...`
+
+So the adapter should translate at least:
+- Anthropic body `model` -> Vertex URL model segment
+- Anthropic header `anthropic-version` -> Vertex body `anthropic_version`
+- Anthropic auth header style -> Gateway/Vertex bearer auth style
 
 ## Local development
 ```bash

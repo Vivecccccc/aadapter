@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,9 +16,19 @@ import (
 )
 
 func main() {
+	verbose := flag.Bool("verbose", false, "enable verbose logging (equivalent to --log-level=debug)")
+	logLevel := flag.String("log-level", "", "log level: debug|info|warning|error")
+	flag.Parse()
+
 	cfg, err := adapter.LoadConfigFromEnv()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	if *verbose {
+		cfg.Verbose = true
+	}
+	if *logLevel != "" {
+		cfg.LogLevel = *logLevel
 	}
 
 	srv, err := adapter.NewServer(cfg)
@@ -31,8 +42,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	log.Printf("adapter listening on %s (log_level=%s verbose=%t)", cfg.ListenAddr, cfg.LogLevel, cfg.Verbose)
 	go func() {
-		log.Printf("adapter listening on %s", cfg.ListenAddr)
 		if err := httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}

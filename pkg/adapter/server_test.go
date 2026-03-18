@@ -43,6 +43,7 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 
 	cfg := Config{
 		ListenAddr:       ":0",
+		LogLevel:         "info",
 		GatewayBaseURL:   gateway.URL,
 		Project:          "p",
 		Location:         "us-central1",

@@ -11,6 +11,8 @@ import (
 
 type Config struct {
 	ListenAddr string
+	Verbose    bool
+	LogLevel   string
 
 	GatewayBaseURL string
 	Project        string
@@ -33,6 +35,8 @@ type Config struct {
 func LoadConfigFromEnv() (Config, error) {
 	cfg := Config{
 		ListenAddr:       envOrDefault("ADAPTER_LISTEN_ADDR", ":8080"),
+		Verbose:          boolOrDefault("ADAPTER_VERBOSE", false),
+		LogLevel:         envOrDefault("ADAPTER_LOG_LEVEL", "info"),
 		GatewayBaseURL:   strings.TrimRight(os.Getenv("GATEWAY_BASE_URL"), "/"),
 		Project:          os.Getenv("VERTEX_PROJECT"),
 		Location:         os.Getenv("VERTEX_LOCATION"),
@@ -57,6 +61,9 @@ func LoadConfigFromEnv() (Config, error) {
 	}
 	if cfg.AuthOTPType != "TOTP" && cfg.AuthOTPType != "PUSH" {
 		return Config{}, fmt.Errorf("AUTH_OTP_TYPE must be TOTP or PUSH")
+	}
+	if !isValidLogLevel(cfg.LogLevel) {
+		return Config{}, fmt.Errorf("ADAPTER_LOG_LEVEL must be one of: debug, info, warning, error")
 	}
 
 	return cfg, nil
@@ -95,4 +102,13 @@ func boolOrDefault(key string, def bool) bool {
 		}
 	}
 	return def
+}
+
+func isValidLogLevel(v string) bool {
+	switch strings.ToLower(v) {
+	case "debug", "info", "warning", "error":
+		return true
+	default:
+		return false
+	}
 }
