@@ -35,7 +35,18 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer tok1" {
 			t.Fatalf("unexpected auth: %q", got)
 		}
+		if r.URL.Path != "/v1/projects/p/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-5:rawPredict" {
+			t.Fatalf("unexpected target path: %s", r.URL.Path)
+		}
 		body, _ := io.ReadAll(r.Body)
+		var got map[string]interface{}
+		_ = json.Unmarshal(body, &got)
+		if _, hasModel := got["model"]; hasModel {
+			t.Fatalf("rewritten request should not include model: %s", string(body))
+		}
+		if got["anthropic_version"] != "vertex-2023-10-16" {
+			t.Fatalf("expected anthropic_version in rewritten body: %s", string(body))
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	}))
@@ -48,7 +59,8 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 		Project:          "p",
 		Location:         "us-central1",
 		Publisher:        "anthropic",
-		Model:            "claude-sonnet-4-5",
+		Model:            "default-model",
+		AnthropicVersion: "vertex-2023-10-16",
 		AuthURL:          authSrv.URL,
 		AuthUserID:       "u",
 		AuthPassword:     "p",
@@ -68,10 +80,59 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec.Body.String() != string(reqBody) {
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"anthropic_version":"vertex-2023-10-16"`)) {
 		t.Fatalf("response mismatch: %s", rec.Body.String())
 	}
 	if atomic.LoadInt32(&authCalls) != 1 {
 		t.Fatalf("expected one auth call")
+	}
+}
+
+func TestAnthropicVersionHeaderMappedToBodyAndModelFallback(t *testing.T) {
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"id_token": "tok1", "expires_in": 3600})
+	}))
+	defer authSrv.Close()
+
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/projects/p/locations/us-central1/publishers/anthropic/models/default-model:rawPredict" {
+			t.Fatalf("expected fallback model path, got: %s", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var got map[string]interface{}
+		_ = json.Unmarshal(body, &got)
+		if got["anthropic_version"] != "vertex-2023-06-01" {
+			t.Fatalf("expected mapped anthropic_version, got body=%s", string(body))
+		}
+		_, _ = w.Write(body)
+	}))
+	defer gateway.Close()
+
+	cfg := Config{
+		ListenAddr:       ":0",
+		LogLevel:         "debug",
+		GatewayBaseURL:   gateway.URL,
+		Project:          "p",
+		Location:         "us-central1",
+		Publisher:        "anthropic",
+		Model:            "default-model",
+		AnthropicVersion: "vertex-2023-10-16",
+		AuthURL:          authSrv.URL,
+		AuthUserID:       "u",
+		AuthPassword:     "p",
+		AuthOTPType:      "TOTP",
+		RefreshSkew:      60,
+		GatewayTimeout:   5e9,
+		AuthTimeout:      5e9,
+	}
+	s, _ := NewServer(cfg)
+
+	reqBody := []byte(`{"stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("anthropic-version", "2023-06-01")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

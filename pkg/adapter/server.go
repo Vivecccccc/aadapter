@@ -75,9 +75,17 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Infof("request_id=%d path=%s method=%s stream=%t model=%s", requestID, r.URL.Path, r.Method, req.Stream, req.Model)
+	rewrittenBody, targetModel, stream, err := s.rewriteRequestForVertex(body, r.Header, req)
+	if err != nil {
+		s.logger.Warnf("request_id=%d failed to rewrite request: %v", requestID, err)
+		http.Error(w, "invalid messages request", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Infof("request_id=%d path=%s method=%s stream=%t model=%s", requestID, r.URL.Path, r.Method, stream, targetModel)
 	s.logger.Debugf("request_id=%d inbound_headers=%s", requestID, formatHeaders(r.Header))
 	s.logger.Debugf("request_id=%d inbound_messages_request_json=\n%s", requestID, prettyJSONOrRaw(body))
+	s.logger.Debugf("request_id=%d rewritten_vertex_request_json=\n%s", requestID, prettyJSONOrRaw(rewrittenBody))
 
 	token, err := s.tokens.GetBearerToken(ctx)
 	if err != nil {
@@ -86,8 +94,8 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetURL := s.cfg.GatewayBaseURL + s.cfg.targetPath(req.Stream)
-	resp, err := s.forward(ctx, body, token, req.Stream)
+	targetURL := s.cfg.GatewayBaseURL + s.cfg.targetPath(stream, targetModel)
+	resp, err := s.forward(ctx, rewrittenBody, token, stream, targetModel)
 	if err != nil {
 		s.logger.Errorf("request_id=%d upstream request failed target=%s err=%v", requestID, targetURL, err)
 		http.Error(w, fmt.Sprintf("upstream failed: %v", err), http.StatusBadGateway)
@@ -100,7 +108,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		newToken, ferr := s.tokens.ForceRefresh(context.Background())
 		if ferr == nil {
 			resp.Body.Close()
-			resp, err = s.forward(ctx, body, newToken, req.Stream)
+			resp, err = s.forward(ctx, rewrittenBody, newToken, stream, targetModel)
 			if err != nil {
 				s.logger.Errorf("request_id=%d retry upstream failed target=%s err=%v", requestID, targetURL, err)
 				http.Error(w, fmt.Sprintf("retry upstream failed: %v", err), http.StatusBadGateway)
@@ -115,7 +123,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	if req.Stream {
+	if stream {
 		captured, copied := streamCopyAndCapture(w, resp.Body)
 		dur := time.Since(startedAt)
 		if resp.StatusCode >= 500 {
@@ -144,8 +152,46 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debugf("request_id=%d upstream_messages_response_json=\n%s", requestID, prettyJSONOrRaw(respBody))
 }
 
-func (s *Server) forward(ctx context.Context, body []byte, bearer string, stream bool) (*http.Response, error) {
-	endpoint, err := url.Parse(s.cfg.GatewayBaseURL + s.cfg.targetPath(stream))
+func (s *Server) rewriteRequestForVertex(body []byte, headers http.Header, parsed messagesRequest) ([]byte, string, bool, error) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, "", false, err
+	}
+
+	targetModel := s.cfg.Model
+	if parsed.Model != "" {
+		targetModel = parsed.Model
+	}
+	delete(payload, "model")
+
+	if _, exists := payload["anthropic_version"]; !exists {
+		if headerVersion := headers.Get("anthropic-version"); headerVersion != "" {
+			payload["anthropic_version"] = toVertexAnthropicVersion(headerVersion)
+		} else {
+			payload["anthropic_version"] = s.cfg.AnthropicVersion
+		}
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return rewritten, targetModel, parsed.Stream, nil
+}
+
+func toVertexAnthropicVersion(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "vertex-") {
+		return trimmed
+	}
+	return "vertex-" + trimmed
+}
+
+func (s *Server) forward(ctx context.Context, body []byte, bearer string, stream bool, model string) (*http.Response, error) {
+	endpoint, err := url.Parse(s.cfg.GatewayBaseURL + s.cfg.targetPath(stream, model))
 	if err != nil {
 		return nil, err
 	}

@@ -14,11 +14,12 @@ type Config struct {
 	Verbose    bool
 	LogLevel   string
 
-	GatewayBaseURL string
-	Project        string
-	Location       string
-	Publisher      string
-	Model          string
+	GatewayBaseURL   string
+	Project          string
+	Location         string
+	Publisher        string
+	Model            string
+	AnthropicVersion string
 
 	AuthURL      string
 	AuthUserID   string
@@ -42,6 +43,7 @@ func LoadConfigFromEnv() (Config, error) {
 		Location:         os.Getenv("VERTEX_LOCATION"),
 		Publisher:        envOrDefault("VERTEX_PUBLISHER", "anthropic"),
 		Model:            os.Getenv("VERTEX_MODEL"),
+		AnthropicVersion: envOrDefault("VERTEX_ANTHROPIC_VERSION", "vertex-2023-10-16"),
 		AuthURL:          os.Getenv("AUTH_URL"),
 		AuthUserID:       os.Getenv("AUTH_USER_ID"),
 		AuthPassword:     os.Getenv("AUTH_PASSWORD"),
@@ -69,12 +71,12 @@ func LoadConfigFromEnv() (Config, error) {
 	return cfg, nil
 }
 
-func (c Config) targetPath(stream bool) string {
+func (c Config) targetPath(stream bool, model string) string {
 	suffix := "rawPredict"
 	if stream {
 		suffix = "streamRawPredict"
 	}
-	return fmt.Sprintf("/v1/projects/%s/locations/%s/publishers/%s/models/%s:%s", c.Project, c.Location, c.Publisher, c.Model, suffix)
+	return fmt.Sprintf("/v1/projects/%s/locations/%s/publishers/%s/models/%s:%s", c.Project, c.Location, c.Publisher, model, suffix)
 }
 
 func envOrDefault(key, val string) string {
