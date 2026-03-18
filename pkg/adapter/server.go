@@ -75,7 +75,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rewrittenBody, targetModel, stream, err := s.rewriteRequestForVertex(body, r.Header, req)
+	rewrittenBody, targetModel, stream, err := s.rewriteRequestForVertex(body, req)
 	if err != nil {
 		s.logger.Warnf("request_id=%d failed to rewrite request: %v", requestID, err)
 		http.Error(w, "invalid messages request", http.StatusBadRequest)
@@ -152,7 +152,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debugf("request_id=%d upstream_messages_response_json=\n%s", requestID, prettyJSONOrRaw(respBody))
 }
 
-func (s *Server) rewriteRequestForVertex(body []byte, headers http.Header, parsed messagesRequest) ([]byte, string, bool, error) {
+func (s *Server) rewriteRequestForVertex(body []byte, parsed messagesRequest) ([]byte, string, bool, error) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, "", false, err
@@ -163,31 +163,13 @@ func (s *Server) rewriteRequestForVertex(body []byte, headers http.Header, parse
 		targetModel = s.cfg.Model
 	}
 	delete(payload, "model")
-
-	if _, exists := payload["anthropic_version"]; !exists {
-		if headerVersion := headers.Get("anthropic-version"); headerVersion != "" {
-			payload["anthropic_version"] = toVertexAnthropicVersion(headerVersion)
-		} else {
-			payload["anthropic_version"] = s.cfg.AnthropicVersion
-		}
-	}
+	payload["anthropic_version"] = s.cfg.AnthropicVersion
 
 	rewritten, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", false, err
 	}
 	return rewritten, targetModel, parsed.Stream, nil
-}
-
-func toVertexAnthropicVersion(v string) string {
-	trimmed := strings.TrimSpace(v)
-	if trimmed == "" {
-		return ""
-	}
-	if strings.HasPrefix(strings.ToLower(trimmed), "vertex-") {
-		return trimmed
-	}
-	return "vertex-" + trimmed
 }
 
 func (s *Server) forward(ctx context.Context, body []byte, bearer string, stream bool, model string) (*http.Response, error) {
