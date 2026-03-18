@@ -80,9 +80,8 @@ Implemented rewrite behavior in this adapter:
 - Adapter always removes request body `model` from the forwarded body.
 - When `MODEL_OVERRIDE=true` (default), adapter always uses `VERTEX_MODEL` for the Vertex URL model segment.
 - When `MODEL_OVERRIDE=false`, adapter uses request body `model` when provided; otherwise falls back to `VERTEX_MODEL`.
-- If body lacks `anthropic_version` and request has `anthropic-version` header, adapter writes `anthropic_version` into forwarded body.
-- If `anthropic-version` is not prefixed with `vertex-`, adapter auto-converts it to `vertex-<value>`.
-- If neither field/header is present, adapter uses `VERTEX_ANTHROPIC_VERSION`.
+- Adapter always sets forwarded body `anthropic_version` from `VERTEX_ANTHROPIC_VERSION`.
+- Request body/header `anthropic_version` values are ignored.
 - Auth remains gateway-style bearer token managed by the token provider.
 
 ## Local development

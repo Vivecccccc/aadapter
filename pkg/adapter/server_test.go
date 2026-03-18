@@ -89,7 +89,7 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 	}
 }
 
-func TestAnthropicVersionHeaderMappedToBodyAndModelFallback(t *testing.T) {
+func TestAnthropicVersionAlwaysUsesEnvConfig(t *testing.T) {
 	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"id_token": "tok1", "expires_in": 3600})
 	}))
@@ -102,8 +102,8 @@ func TestAnthropicVersionHeaderMappedToBodyAndModelFallback(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		var got map[string]interface{}
 		_ = json.Unmarshal(body, &got)
-		if got["anthropic_version"] != "vertex-2023-06-01" {
-			t.Fatalf("expected mapped anthropic_version, got body=%s", string(body))
+		if got["anthropic_version"] != "vertex-2023-10-16" {
+			t.Fatalf("expected env anthropic_version override, got body=%s", string(body))
 		}
 		_, _ = w.Write(body)
 	}))
@@ -129,7 +129,7 @@ func TestAnthropicVersionHeaderMappedToBodyAndModelFallback(t *testing.T) {
 	}
 	s, _ := NewServer(cfg)
 
-	reqBody := []byte(`{"stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	reqBody := []byte(`{"anthropic_version":"vertex-2099-01-01","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
 	req.Header.Set("anthropic-version", "2023-06-01")
 	rec := httptest.NewRecorder()
