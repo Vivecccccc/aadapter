@@ -19,6 +19,7 @@ type Config struct {
 	Location         string
 	Publisher        string
 	Model            string
+	ModelOverride    bool
 	AnthropicVersion string
 
 	AuthURL      string
@@ -43,6 +44,7 @@ func LoadConfigFromEnv() (Config, error) {
 		Location:         os.Getenv("VERTEX_LOCATION"),
 		Publisher:        envOrDefault("VERTEX_PUBLISHER", "anthropic"),
 		Model:            os.Getenv("VERTEX_MODEL"),
+		ModelOverride:    boolOrDefault("MODEL_OVERRIDE", true),
 		AnthropicVersion: envOrDefault("VERTEX_ANTHROPIC_VERSION", "vertex-2023-10-16"),
 		AuthURL:          os.Getenv("AUTH_URL"),
 		AuthUserID:       os.Getenv("AUTH_USER_ID"),

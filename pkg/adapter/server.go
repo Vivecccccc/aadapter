@@ -158,9 +158,9 @@ func (s *Server) rewriteRequestForVertex(body []byte, headers http.Header, parse
 		return nil, "", false, err
 	}
 
-	targetModel := s.cfg.Model
-	if parsed.Model != "" {
-		targetModel = parsed.Model
+	targetModel := parsed.Model
+	if targetModel == "" || s.cfg.ModelOverride {
+		targetModel = s.cfg.Model
 	}
 	delete(payload, "model")
 

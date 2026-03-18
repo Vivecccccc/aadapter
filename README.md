@@ -28,6 +28,7 @@ A high-performance Go adapter that accepts Anthropic-compatible `/v1/messages` r
 - `GATEWAY_TIMEOUT` (default `120s`)
 - `FORCE_REFRESH_ON_401_403` (default `true`)
 - `VERTEX_ANTHROPIC_VERSION` (default `vertex-2023-10-16`)
+- `MODEL_OVERRIDE` (default `true`)
 
 ## Logging controls (`--verbose`, `--log-level`)
 You can control runtime logs with CLI flags:
@@ -76,8 +77,9 @@ For Vertex Claude (`rawPredict`/`streamRawPredict`), Google samples show:
 - auth via `Authorization: Bearer ...`
 
 Implemented rewrite behavior in this adapter:
-- If request body has `model`, adapter uses it as Vertex URL model segment and removes `model` from forwarded body.
-- If body does not include `model`, adapter falls back to `VERTEX_MODEL`.
+- Adapter always removes request body `model` from the forwarded body.
+- When `MODEL_OVERRIDE=true` (default), adapter always uses `VERTEX_MODEL` for the Vertex URL model segment.
+- When `MODEL_OVERRIDE=false`, adapter uses request body `model` when provided; otherwise falls back to `VERTEX_MODEL`.
 - If body lacks `anthropic_version` and request has `anthropic-version` header, adapter writes `anthropic_version` into forwarded body.
 - If `anthropic-version` is not prefixed with `vertex-`, adapter auto-converts it to `vertex-<value>`.
 - If neither field/header is present, adapter uses `VERTEX_ANTHROPIC_VERSION`.
