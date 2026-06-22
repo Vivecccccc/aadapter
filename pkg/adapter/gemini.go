@@ -14,6 +14,10 @@ import (
 const synthesizedToolIDPrefix = "gemini_synth_"
 
 func anthropicMessagesToGemini(body []byte) ([]byte, error) {
+	return anthropicMessagesToGeminiWithSignatures(body, nil)
+}
+
+func anthropicMessagesToGeminiWithSignatures(body []byte, signatures map[string]string) ([]byte, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, err
@@ -29,7 +33,7 @@ func anthropicMessagesToGemini(body []byte) ([]byte, error) {
 		dst["systemInstruction"] = system
 	}
 
-	contents, err := buildGeminiContents(src)
+	contents, err := buildGeminiContents(src, signatures)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +152,7 @@ func collectAnthropicTexts(value interface{}, field string) ([]string, error) {
 	}
 }
 
-func buildGeminiContents(src map[string]interface{}) ([]interface{}, error) {
+func buildGeminiContents(src map[string]interface{}, signatures map[string]string) ([]interface{}, error) {
 	rawMessages, ok := src["messages"].([]interface{})
 	if !ok {
 		return nil, fmt.Errorf("messages must be an array")
@@ -192,7 +196,7 @@ func buildGeminiContents(src map[string]interface{}) ([]interface{}, error) {
 		} else if role != "user" {
 			return nil, fmt.Errorf("unsupported message role for Gemini conversion: %s", role)
 		}
-		parts, err := convertAnthropicContentToGeminiParts(message["content"], role, toolNameByID)
+		parts, err := convertAnthropicContentToGeminiParts(message["content"], role, toolNameByID, signatures)
 		if err != nil {
 			return nil, err
 		}
@@ -207,7 +211,7 @@ func buildGeminiContents(src map[string]interface{}) ([]interface{}, error) {
 	return contents, nil
 }
 
-func convertAnthropicContentToGeminiParts(content interface{}, role string, toolNameByID map[string]string) ([]interface{}, error) {
+func convertAnthropicContentToGeminiParts(content interface{}, role string, toolNameByID map[string]string, signatures map[string]string) ([]interface{}, error) {
 	switch v := content.(type) {
 	case string:
 		if v == "" {
@@ -254,7 +258,11 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 					call["id"] = id
 				}
 				part := map[string]interface{}{"functionCall": call}
-				if signature := thoughtSignature(block); signature != "" {
+				signature := thoughtSignature(block)
+				if signature == "" && id != "" {
+					signature = signatures[id]
+				}
+				if signature != "" {
 					part["thoughtSignature"] = signature
 				}
 				parts = append(parts, part)
@@ -477,15 +485,29 @@ func buildGeminiToolConfig(src map[string]interface{}) (map[string]interface{}, 
 }
 
 func geminiResponseToAnthropic(body []byte) ([]byte, error) {
+	converted, _, err := geminiResponseToAnthropicWithSignatures(body)
+	return converted, err
+}
+
+func geminiResponseToAnthropicWithSignatures(body []byte) ([]byte, map[string]string, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(body, &src); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	response := geminiObjectToAnthropic(src)
-	return json.Marshal(response)
+	response, signatures := geminiObjectToAnthropicWithSignatures(src)
+	converted, err := json.Marshal(response)
+	if err != nil {
+		return nil, nil, err
+	}
+	return converted, signatures, nil
 }
 
 func geminiObjectToAnthropic(src map[string]interface{}) map[string]interface{} {
+	response, _ := geminiObjectToAnthropicWithSignatures(src)
+	return response
+}
+
+func geminiObjectToAnthropicWithSignatures(src map[string]interface{}) (map[string]interface{}, map[string]string) {
 	if feedback, _ := src["promptFeedback"].(map[string]interface{}); feedback != nil {
 		if reason, _ := feedback["blockReason"].(string); reason != "" {
 			return map[string]interface{}{
@@ -497,11 +519,12 @@ func geminiObjectToAnthropic(src map[string]interface{}) map[string]interface{} 
 				"stop_reason":   "refusal",
 				"stop_sequence": nil,
 				"usage":         buildAnthropicUsage(src["usageMetadata"]),
-			}
+			}, nil
 		}
 	}
 	candidate := firstCandidate(src)
 	content := []interface{}{}
+	signatures := map[string]string{}
 	hasToolUse := false
 	contentValue, _ := candidate["content"].(map[string]interface{})
 	if parts, _ := contentValue["parts"].([]interface{}); parts != nil {
@@ -527,6 +550,7 @@ func geminiObjectToAnthropic(src map[string]interface{}) map[string]interface{} 
 				}
 				if signature := thoughtSignature(part); signature != "" {
 					block["thought_signature"] = signature
+					signatures[id] = signature
 				}
 				content = append(content, block)
 			}
@@ -541,7 +565,7 @@ func geminiObjectToAnthropic(src map[string]interface{}) map[string]interface{} 
 		"stop_reason":   mapGeminiFinishReason(candidate["finishReason"], hasToolUse),
 		"stop_sequence": nil,
 		"usage":         buildAnthropicUsage(src["usageMetadata"]),
-	}
+	}, signatures
 }
 
 func firstCandidate(src map[string]interface{}) map[string]interface{} {
@@ -689,11 +713,15 @@ func (s *Server) streamGeminiAsAnthropic(w http.ResponseWriter, r io.Reader) ([]
 						toolIDByKey[key] = id
 					}
 				}
+				signature := thoughtSignature(part)
+				if signature != "" {
+					s.rememberThoughtSignatures(map[string]string{id: signature})
+				}
 				toolUses = append(toolUses, map[string]interface{}{
 					"id":                id,
 					"name":              stringOrEmpty(call["name"]),
 					"input":             objectOrEmpty(call["args"]),
-					"thought_signature": thoughtSignature(part),
+					"thought_signature": signature,
 				})
 			}
 		}

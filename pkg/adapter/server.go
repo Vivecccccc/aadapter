@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -30,6 +31,9 @@ type Server struct {
 	handler http.Handler
 	logger  *Logger
 	reqID   uint64
+
+	thoughtSignaturesMu sync.Mutex
+	thoughtSignatures   map[string]string
 }
 
 type messagesRequest struct {
@@ -47,6 +51,8 @@ func NewServer(cfg Config) (*Server, error) {
 		tokens:  newTokenProvider(cfg),
 		gateway: &http.Client{Timeout: cfg.GatewayTimeout},
 		logger:  NewLogger(cfg.LogLevel, cfg.Verbose),
+
+		thoughtSignatures: map[string]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
@@ -86,6 +92,9 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.Debugf("request_id=%d inbound_headers=%s", requestID, formatHeaders(r.Header))
+	s.logger.Debugf("request_id=%d inbound_messages_request_json=\n%s", requestID, prettyJSONOrRaw(body))
+
 	rewrittenBody, targetModel, stream, op, err := s.rewriteRequestForVertex(body, req)
 	if err != nil {
 		s.logger.Warnf("request_id=%d failed to rewrite request: %v", requestID, err)
@@ -94,8 +103,6 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Infof("request_id=%d path=%s method=%s stream=%t model=%s", requestID, r.URL.Path, r.Method, stream, targetModel)
-	s.logger.Debugf("request_id=%d inbound_headers=%s", requestID, formatHeaders(r.Header))
-	s.logger.Debugf("request_id=%d inbound_messages_request_json=\n%s", requestID, prettyJSONOrRaw(body))
 	s.logger.Debugf("request_id=%d rewritten_vertex_request_json=\n%s", requestID, prettyJSONOrRaw(rewrittenBody))
 
 	token, err := s.tokens.GetBearerToken(ctx)
@@ -160,12 +167,13 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	respBody, _ := io.ReadAll(resp.Body)
 	convertedGemini := false
 	if s.cfg.VertexAPIFormat == "gemini" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		converted, err := geminiResponseToAnthropic(respBody)
+		converted, signatures, err := geminiResponseToAnthropicWithSignatures(respBody)
 		if err != nil {
 			s.logger.Warnf("request_id=%d failed to convert Gemini response: %v", requestID, err)
 			http.Error(w, "invalid Gemini response", http.StatusBadGateway)
 			return
 		}
+		s.rememberThoughtSignatures(signatures)
 		respBody = converted
 		convertedGemini = true
 	}
@@ -198,7 +206,7 @@ func (s *Server) rewriteRequestForVertex(body []byte, parsed messagesRequest) ([
 		targetModel = s.cfg.Model
 	}
 	if s.cfg.VertexAPIFormat == "gemini" {
-		rewritten, err := anthropicMessagesToGemini(body)
+		rewritten, err := anthropicMessagesToGeminiWithSignatures(body, s.snapshotThoughtSignatures())
 		if err != nil {
 			return nil, "", false, "", err
 		}
@@ -220,6 +228,32 @@ func (s *Server) rewriteRequestForVertex(body []byte, parsed messagesRequest) ([
 		op = operationStreamRawPredict
 	}
 	return rewritten, targetModel, parsed.Stream, op, nil
+}
+
+func (s *Server) rememberThoughtSignatures(signatures map[string]string) {
+	if len(signatures) == 0 {
+		return
+	}
+	s.thoughtSignaturesMu.Lock()
+	defer s.thoughtSignaturesMu.Unlock()
+	for id, signature := range signatures {
+		if id != "" && signature != "" {
+			s.thoughtSignatures[id] = signature
+		}
+	}
+}
+
+func (s *Server) snapshotThoughtSignatures() map[string]string {
+	s.thoughtSignaturesMu.Lock()
+	defer s.thoughtSignaturesMu.Unlock()
+	if len(s.thoughtSignatures) == 0 {
+		return nil
+	}
+	copied := make(map[string]string, len(s.thoughtSignatures))
+	for id, signature := range s.thoughtSignatures {
+		copied[id] = signature
+	}
+	return copied
 }
 
 func (s *Server) forward(ctx context.Context, body []byte, bearer string, op vertexOperation, model string) (*http.Response, error) {
@@ -268,11 +302,13 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
 		return
 	}
+	s.logger.Debugf("request_id=%d inbound_headers=%s", requestID, formatHeaders(r.Header))
+	s.logger.Debugf("request_id=%d inbound_count_tokens_request_json=\n%s", requestID, prettyJSONOrRaw(body))
 	targetModel := req.Model
 	if targetModel == "" || s.cfg.ModelOverride {
 		targetModel = s.cfg.Model
 	}
-	rewritten, err := anthropicMessagesToGemini(body)
+	rewritten, err := anthropicMessagesToGeminiWithSignatures(body, s.snapshotThoughtSignatures())
 	if err != nil {
 		s.logger.Warnf("request_id=%d failed to rewrite count_tokens request: %v", requestID, err)
 		http.Error(w, "invalid messages request", http.StatusBadRequest)

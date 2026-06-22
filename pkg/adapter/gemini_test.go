@@ -145,6 +145,89 @@ func TestGeminiToolUseResponsePreservesThoughtSignature(t *testing.T) {
 	}
 }
 
+func TestGeminiServerRestoresStoredThoughtSignatureWhenClaudeDropsIt(t *testing.T) {
+	authSrv := newStaticAuthServer(t)
+	defer authSrv.Close()
+
+	requestNumber := 0
+	var firstToolID string
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestNumber++
+		body, _ := io.ReadAll(r.Body)
+		switch requestNumber {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"responseId":"resp_tool",
+				"modelVersion":"gemini-3.5-flash",
+				"candidates":[{"finishReason":"STOP","content":{"parts":[{"functionCall":{"name":"Bash","args":{}},"thoughtSignature":"sig_server"}]}}],
+				"usageMetadata":{"promptTokenCount":5,"totalTokenCount":8}
+			}`))
+		case 2:
+			var got map[string]interface{}
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatalf("decode second Gemini request: %v body=%s", err, string(body))
+			}
+			contents := got["contents"].([]interface{})
+			modelContent := contents[1].(map[string]interface{})
+			parts := modelContent["parts"].([]interface{})
+			callPart := parts[0].(map[string]interface{})
+			if callPart["thoughtSignature"] != "sig_server" {
+				t.Fatalf("stored thoughtSignature not restored: %s", string(body))
+			}
+			call := callPart["functionCall"].(map[string]interface{})
+			if call["name"] != "Bash" {
+				t.Fatalf("functionCall mismatch: %s", string(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"responseId":"resp_done",
+				"modelVersion":"gemini-3.5-flash",
+				"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"done"}]}}],
+				"usageMetadata":{"promptTokenCount":8,"totalTokenCount":9}
+			}`))
+		default:
+			t.Fatalf("unexpected gateway request %d", requestNumber)
+		}
+	}))
+	defer gateway.Close()
+
+	s, _ := NewServer(geminiTestConfig(gateway.URL, authSrv.URL))
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"claude-sonnet-4-6",
+		"messages":[{"role":"user","content":"run pwd"}],
+		"tools":[{"name":"Bash","input_schema":{"type":"object"}}]
+	}`)))
+	firstRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	var firstResp map[string]interface{}
+	_ = json.Unmarshal(firstRec.Body.Bytes(), &firstResp)
+	firstBlock := firstResp["content"].([]interface{})[0].(map[string]interface{})
+	firstToolID = firstBlock["id"].(string)
+	if firstBlock["thought_signature"] != "sig_server" {
+		t.Fatalf("first response missing thought_signature: %s", firstRec.Body.String())
+	}
+
+	secondBody := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"messages":[
+			{"role":"user","content":"run pwd"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"` + firstToolID + `","name":"Bash","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + firstToolID + `","content":[{"type":"text","text":"ok"}]}]}
+		],
+		"tools":[{"name":"Bash","input_schema":{"type":"object"}}]
+	}`)
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	secondRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+}
+
 func TestGeminiToolSchemaUsesParametersJSONSchemaForComplexKeywords(t *testing.T) {
 	rewritten, err := anthropicMessagesToGemini([]byte(`{
 		"messages":[{"role":"user","content":"hi"}],
