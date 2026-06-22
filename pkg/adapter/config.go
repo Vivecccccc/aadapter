@@ -15,6 +15,7 @@ type Config struct {
 	LogLevel   string
 
 	GatewayBaseURL   string
+	VertexAPIFormat  string
 	Project          string
 	Location         string
 	Publisher        string
@@ -35,14 +36,20 @@ type Config struct {
 }
 
 func LoadConfigFromEnv() (Config, error) {
+	apiFormat := envOrDefault("VERTEX_API_FORMAT", "anthropic")
+	publisherDefault := "anthropic"
+	if apiFormat == "gemini" {
+		publisherDefault = "google"
+	}
 	cfg := Config{
 		ListenAddr:       envOrDefault("ADAPTER_LISTEN_ADDR", ":8080"),
 		Verbose:          boolOrDefault("ADAPTER_VERBOSE", false),
 		LogLevel:         envOrDefault("ADAPTER_LOG_LEVEL", "info"),
 		GatewayBaseURL:   strings.TrimRight(os.Getenv("GATEWAY_BASE_URL"), "/"),
+		VertexAPIFormat:  apiFormat,
 		Project:          os.Getenv("VERTEX_PROJECT"),
 		Location:         os.Getenv("VERTEX_LOCATION"),
-		Publisher:        envOrDefault("VERTEX_PUBLISHER", "anthropic"),
+		Publisher:        envOrDefault("VERTEX_PUBLISHER", publisherDefault),
 		Model:            os.Getenv("VERTEX_MODEL"),
 		ModelOverride:    boolOrDefault("MODEL_OVERRIDE", true),
 		AnthropicVersion: envOrDefault("VERTEX_ANTHROPIC_VERSION", "vertex-2023-10-16"),
@@ -69,16 +76,18 @@ func LoadConfigFromEnv() (Config, error) {
 	if !isValidLogLevel(cfg.LogLevel) {
 		return Config{}, fmt.Errorf("ADAPTER_LOG_LEVEL must be one of: debug, info, warning, error")
 	}
+	if cfg.VertexAPIFormat != "anthropic" && cfg.VertexAPIFormat != "gemini" {
+		return Config{}, fmt.Errorf("VERTEX_API_FORMAT must be anthropic or gemini")
+	}
+	if cfg.VertexAPIFormat == "gemini" && cfg.Publisher != "google" {
+		return Config{}, fmt.Errorf("VERTEX_PUBLISHER must be google when VERTEX_API_FORMAT=gemini")
+	}
 
 	return cfg, nil
 }
 
-func (c Config) targetPath(stream bool, model string) string {
-	suffix := "rawPredict"
-	if stream {
-		suffix = "streamRawPredict"
-	}
-	return fmt.Sprintf("/v1/projects/%s/locations/%s/publishers/%s/models/%s:%s", c.Project, c.Location, c.Publisher, model, suffix)
+func (c Config) targetPath(op vertexOperation, model string) string {
+	return fmt.Sprintf("/v1/projects/%s/locations/%s/publishers/%s/models/%s:%s", c.Project, c.Location, c.Publisher, model, op)
 }
 
 func envOrDefault(key, val string) string {

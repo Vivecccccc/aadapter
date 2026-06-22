@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+type vertexOperation string
+
+const (
+	operationRawPredict            vertexOperation = "rawPredict"
+	operationStreamRawPredict      vertexOperation = "streamRawPredict"
+	operationGenerateContent       vertexOperation = "generateContent"
+	operationStreamGenerateContent vertexOperation = "streamGenerateContent"
+	operationCountTokens           vertexOperation = "countTokens"
+)
+
 type Server struct {
 	cfg     Config
 	tokens  *tokenProvider
@@ -41,6 +51,7 @@ func NewServer(cfg Config) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/v1/messages", s.messages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.countTokens)
 	s.handler = loggingMiddleware(mux, s.logger)
 	return s, nil
 }
@@ -75,7 +86,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rewrittenBody, targetModel, stream, err := s.rewriteRequestForVertex(body, req)
+	rewrittenBody, targetModel, stream, op, err := s.rewriteRequestForVertex(body, req)
 	if err != nil {
 		s.logger.Warnf("request_id=%d failed to rewrite request: %v", requestID, err)
 		http.Error(w, "invalid messages request", http.StatusBadRequest)
@@ -94,8 +105,8 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetURL := s.cfg.GatewayBaseURL + s.cfg.targetPath(stream, targetModel)
-	resp, err := s.forward(ctx, rewrittenBody, token, stream, targetModel)
+	targetURL := s.cfg.GatewayBaseURL + s.cfg.targetPath(op, targetModel)
+	resp, err := s.forward(ctx, rewrittenBody, token, op, targetModel)
 	if err != nil {
 		s.logger.Errorf("request_id=%d upstream request failed target=%s err=%v", requestID, targetURL, err)
 		http.Error(w, fmt.Sprintf("upstream failed: %v", err), http.StatusBadGateway)
@@ -108,7 +119,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		newToken, ferr := s.tokens.ForceRefresh(context.Background())
 		if ferr == nil {
 			resp.Body.Close()
-			resp, err = s.forward(ctx, rewrittenBody, newToken, stream, targetModel)
+			resp, err = s.forward(ctx, rewrittenBody, newToken, op, targetModel)
 			if err != nil {
 				s.logger.Errorf("request_id=%d retry upstream failed target=%s err=%v", requestID, targetURL, err)
 				http.Error(w, fmt.Sprintf("retry upstream failed: %v", err), http.StatusBadGateway)
@@ -120,11 +131,19 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
 	if stream {
-		captured, copied := streamCopyAndCapture(w, resp.Body)
+		copyHeaders(w.Header(), resp.Header)
+		if s.cfg.VertexAPIFormat == "gemini" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			w.Header().Set("Content-Type", "text/event-stream")
+		}
+		w.WriteHeader(resp.StatusCode)
+		var captured []byte
+		var copied int
+		if s.cfg.VertexAPIFormat == "gemini" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			captured, copied = s.streamGeminiAsAnthropic(w, resp.Body)
+		} else {
+			captured, copied = streamCopyAndCapture(w, resp.Body)
+		}
 		dur := time.Since(startedAt)
 		if resp.StatusCode >= 500 {
 			s.logger.Errorf("request_id=%d completed stream status=%d bytes=%d duration=%s target=%s", requestID, resp.StatusCode, copied, dur, targetURL)
@@ -139,6 +158,22 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respBody, _ := io.ReadAll(resp.Body)
+	convertedGemini := false
+	if s.cfg.VertexAPIFormat == "gemini" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		converted, err := geminiResponseToAnthropic(respBody)
+		if err != nil {
+			s.logger.Warnf("request_id=%d failed to convert Gemini response: %v", requestID, err)
+			http.Error(w, "invalid Gemini response", http.StatusBadGateway)
+			return
+		}
+		respBody = converted
+		convertedGemini = true
+	}
+	copyHeaders(w.Header(), resp.Header)
+	if convertedGemini {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 	dur := time.Since(startedAt)
 	if resp.StatusCode >= 500 {
@@ -152,28 +187,47 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debugf("request_id=%d upstream_messages_response_json=\n%s", requestID, prettyJSONOrRaw(respBody))
 }
 
-func (s *Server) rewriteRequestForVertex(body []byte, parsed messagesRequest) ([]byte, string, bool, error) {
+func (s *Server) rewriteRequestForVertex(body []byte, parsed messagesRequest) ([]byte, string, bool, vertexOperation, error) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, "", false, err
+		return nil, "", false, "", err
 	}
 
 	targetModel := parsed.Model
 	if targetModel == "" || s.cfg.ModelOverride {
 		targetModel = s.cfg.Model
 	}
+	if s.cfg.VertexAPIFormat == "gemini" {
+		rewritten, err := anthropicMessagesToGemini(body)
+		if err != nil {
+			return nil, "", false, "", err
+		}
+		op := operationGenerateContent
+		if parsed.Stream {
+			op = operationStreamGenerateContent
+		}
+		return rewritten, targetModel, parsed.Stream, op, nil
+	}
 	delete(payload, "model")
 	payload["anthropic_version"] = s.cfg.AnthropicVersion
 
 	rewritten, err := json.Marshal(payload)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, "", err
 	}
-	return rewritten, targetModel, parsed.Stream, nil
+	op := operationRawPredict
+	if parsed.Stream {
+		op = operationStreamRawPredict
+	}
+	return rewritten, targetModel, parsed.Stream, op, nil
 }
 
-func (s *Server) forward(ctx context.Context, body []byte, bearer string, stream bool, model string) (*http.Response, error) {
-	endpoint, err := url.Parse(s.cfg.GatewayBaseURL + s.cfg.targetPath(stream, model))
+func (s *Server) forward(ctx context.Context, body []byte, bearer string, op vertexOperation, model string) (*http.Response, error) {
+	target := s.cfg.GatewayBaseURL + s.cfg.targetPath(op, model)
+	if op == operationStreamGenerateContent {
+		target += "?alt=sse"
+	}
+	endpoint, err := url.Parse(target)
 	if err != nil {
 		return nil, err
 	}
@@ -185,11 +239,74 @@ func (s *Server) forward(ctx context.Context, body []byte, bearer string, stream
 	req.Header.Set("Authorization", bearer)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if stream {
+	if op == operationStreamRawPredict || op == operationStreamGenerateContent {
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
 	return s.gateway.Do(req)
+}
+
+func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	requestID := atomic.AddUint64(&s.reqID, 1)
+	if s.cfg.VertexAPIFormat != "gemini" {
+		http.Error(w, "count_tokens is only implemented for VERTEX_API_FORMAT=gemini", http.StatusNotImplemented)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.logger.Warnf("request_id=%d failed to read count_tokens body: %v", requestID, err)
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+	var req messagesRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.logger.Warnf("request_id=%d invalid count_tokens json body: %v", requestID, err)
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	targetModel := req.Model
+	if targetModel == "" || s.cfg.ModelOverride {
+		targetModel = s.cfg.Model
+	}
+	rewritten, err := anthropicMessagesToGemini(body)
+	if err != nil {
+		s.logger.Warnf("request_id=%d failed to rewrite count_tokens request: %v", requestID, err)
+		http.Error(w, "invalid messages request", http.StatusBadRequest)
+		return
+	}
+	token, err := s.tokens.GetBearerToken(r.Context())
+	if err != nil {
+		s.logger.Errorf("request_id=%d token retrieval failed: %v", requestID, err)
+		http.Error(w, fmt.Sprintf("get token failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	resp, err := s.forward(r.Context(), rewritten, token, operationCountTokens, targetModel)
+	if err != nil {
+		s.logger.Errorf("request_id=%d upstream count_tokens failed: %v", requestID, err)
+		http.Error(w, fmt.Sprintf("upstream failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	copyHeaders(w.Header(), resp.Header)
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		converted, err := geminiCountTokensToAnthropic(respBody)
+		if err != nil {
+			s.logger.Warnf("request_id=%d failed to convert Gemini count_tokens response: %v", requestID, err)
+			http.Error(w, "invalid Gemini count_tokens response", http.StatusBadGateway)
+			return
+		}
+		respBody = converted
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(respBody)
 }
 
 func streamCopyAndCapture(w http.ResponseWriter, r io.Reader) ([]byte, int) {

@@ -28,6 +28,7 @@ A high-performance Go adapter that accepts Anthropic-compatible `/v1/messages` r
 - `GATEWAY_TIMEOUT` (default `120s`)
 - `FORCE_REFRESH_ON_401_403` (default `true`)
 - `VERTEX_ANTHROPIC_VERSION` (default `vertex-2023-10-16`)
+- `VERTEX_API_FORMAT` (`anthropic` or `gemini`, default `anthropic`)
 - `MODEL_OVERRIDE` (default `true`)
 
 ## Logging controls (`--verbose`, `--log-level`)
@@ -65,6 +66,37 @@ Do **not** append the Vertex route suffix yourself. The adapter appends:
 
 So if `GATEWAY_BASE_URL=https://gateway.example.com`, final forwarded URL is like:
 `https://gateway.example.com/v1/projects/...:rawPredict`
+
+## Vertex API formats
+
+`VERTEX_API_FORMAT=anthropic` keeps the original Anthropic partner-model behavior:
+
+- Vertex publisher defaults to `anthropic`
+- `/v1/messages` forwards to `:rawPredict`
+- streaming forwards to `:streamRawPredict`
+- body field `model` is removed
+- body field `anthropic_version` is set from `VERTEX_ANTHROPIC_VERSION`
+
+`VERTEX_API_FORMAT=gemini` enables Google Gemini native conversion for Claude Code:
+
+- Vertex publisher defaults to `google`
+- `VERTEX_MODEL` is the configurable model segment after `/models/`, for example `gemini-3.5-flash`
+- `/v1/messages` forwards to `:generateContent`
+- streaming forwards to `:streamGenerateContent?alt=sse`
+- `/v1/messages/count_tokens` forwards to `:countTokens`
+- Anthropic Messages requests are converted to Gemini `contents`, `systemInstruction`, `tools`, `toolConfig`, and `generationConfig`
+- Gemini responses and Gemini SSE are converted back to Anthropic Messages/SSE for Claude Code
+- Claude-only fields such as `context_management` are recognized and not forwarded to Gemini
+- `output_config.effort` maps to Gemini `generationConfig.thinkingConfig.thinkingLevel` (`low`, `medium`, `high`, `max`, and Claude Code `xhigh` are handled explicitly)
+
+Example Gemini setup:
+
+```bash
+export VERTEX_API_FORMAT=gemini
+export VERTEX_MODEL=gemini-3.5-flash
+# Optional. This is the default when VERTEX_API_FORMAT=gemini.
+export VERTEX_PUBLISHER=google
+```
 
 ## Claude Messages vs Vertex Claude rawPredict compatibility
 For Anthropic-native Messages API (`POST /v1/messages`), requests commonly include:
