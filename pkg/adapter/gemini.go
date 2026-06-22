@@ -253,7 +253,11 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 				if id != "" && !strings.HasPrefix(id, synthesizedToolIDPrefix) {
 					call["id"] = id
 				}
-				parts = append(parts, map[string]interface{}{"functionCall": call})
+				part := map[string]interface{}{"functionCall": call}
+				if signature := thoughtSignature(block); signature != "" {
+					part["thoughtSignature"] = signature
+				}
+				parts = append(parts, part)
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
 				name := toolNameByID[toolUseID]
@@ -515,12 +519,16 @@ func geminiObjectToAnthropic(src map[string]interface{}) map[string]interface{} 
 				if id == "" {
 					id = synthesizeToolID()
 				}
-				content = append(content, map[string]interface{}{
+				block := map[string]interface{}{
 					"type":  "tool_use",
 					"id":    id,
 					"name":  stringOrEmpty(call["name"]),
 					"input": objectOrEmpty(call["args"]),
-				})
+				}
+				if signature := thoughtSignature(part); signature != "" {
+					block["thought_signature"] = signature
+				}
+				content = append(content, block)
 			}
 		}
 	}
@@ -682,9 +690,10 @@ func (s *Server) streamGeminiAsAnthropic(w http.ResponseWriter, r io.Reader) ([]
 					}
 				}
 				toolUses = append(toolUses, map[string]interface{}{
-					"id":    id,
-					"name":  stringOrEmpty(call["name"]),
-					"input": objectOrEmpty(call["args"]),
+					"id":                id,
+					"name":              stringOrEmpty(call["name"]),
+					"input":             objectOrEmpty(call["args"]),
+					"thought_signature": thoughtSignature(part),
 				})
 			}
 		}
@@ -751,10 +760,14 @@ func (s *Server) streamGeminiAsAnthropic(w http.ResponseWriter, r io.Reader) ([]
 		seenTools[key] = true
 		index := nextIndex
 		nextIndex++
+		block := map[string]interface{}{"type": "tool_use", "id": tool["id"], "name": tool["name"]}
+		if signature := stringOrEmpty(tool["thought_signature"]); signature != "" {
+			block["thought_signature"] = signature
+		}
 		writeEvent("content_block_start", map[string]interface{}{
 			"type":          "content_block_start",
 			"index":         index,
-			"content_block": map[string]interface{}{"type": "tool_use", "id": tool["id"], "name": tool["name"]},
+			"content_block": block,
 		})
 		partial, _ := json.Marshal(tool["input"])
 		writeEvent("content_block_delta", map[string]interface{}{
@@ -852,6 +865,16 @@ func stableToolCallKey(call map[string]interface{}) string {
 	name := stringOrEmpty(call["name"])
 	args, _ := json.Marshal(objectOrEmpty(call["args"]))
 	return name + ":" + string(args)
+}
+
+func thoughtSignature(value map[string]interface{}) string {
+	if value == nil {
+		return ""
+	}
+	if signature := stringOrEmpty(value["thoughtSignature"]); signature != "" {
+		return signature
+	}
+	return stringOrEmpty(value["thought_signature"])
 }
 
 func normalizeToolResult(value interface{}) map[string]interface{} {

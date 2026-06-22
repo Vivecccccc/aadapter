@@ -100,7 +100,7 @@ func TestGeminiMessagesTransformUsesVertexGenerateContent(t *testing.T) {
 func TestGeminiToolResultAndToolUseMapping(t *testing.T) {
 	rewritten, err := anthropicMessagesToGemini([]byte(`{
 		"messages":[
-			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"README.md"}}]},
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"README.md"},"thought_signature":"sig_a"}]},
 			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"ok"}]}]}
 		]
 	}`))
@@ -114,9 +114,34 @@ func TestGeminiToolResultAndToolUseMapping(t *testing.T) {
 	if call["name"] != "read_file" || call["id"] != "call_1" {
 		t.Fatalf("functionCall mismatch: %s", string(rewritten))
 	}
+	part := contents[0].(map[string]interface{})["parts"].([]interface{})[0].(map[string]interface{})
+	if part["thoughtSignature"] != "sig_a" {
+		t.Fatalf("thoughtSignature must be preserved on functionCall part: %s", string(rewritten))
+	}
 	response := contents[1].(map[string]interface{})["parts"].([]interface{})[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
 	if response["name"] != "read_file" || response["id"] != "call_1" {
 		t.Fatalf("functionResponse mismatch: %s", string(rewritten))
+	}
+}
+
+func TestGeminiToolUseResponsePreservesThoughtSignature(t *testing.T) {
+	converted, err := geminiResponseToAnthropic([]byte(`{
+		"responseId":"resp_tool",
+		"modelVersion":"gemini-3.5-flash",
+		"candidates":[{"finishReason":"STOP","content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"README.md"}},"thoughtSignature":"sig_a"}]}}],
+		"usageMetadata":{"promptTokenCount":5,"totalTokenCount":8}
+	}`))
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+	var got map[string]interface{}
+	_ = json.Unmarshal(converted, &got)
+	block := got["content"].([]interface{})[0].(map[string]interface{})
+	if block["type"] != "tool_use" || block["thought_signature"] != "sig_a" {
+		t.Fatalf("tool_use thought_signature mismatch: %s", string(converted))
+	}
+	if id, _ := block["id"].(string); !strings.HasPrefix(id, synthesizedToolIDPrefix) {
+		t.Fatalf("expected synthesized tool_use id, got: %s", string(converted))
 	}
 }
 
@@ -168,6 +193,32 @@ func TestGeminiStreamGenerateContentConvertsToAnthropicSSE(t *testing.T) {
 	for _, want := range []string{"event: message_start", "text_delta", `"text":"he"`, `"text":"llo"`, "event: message_delta", `"stop_reason":"end_turn"`, "event: message_stop"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("stream response missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestGeminiStreamPreservesToolUseThoughtSignature(t *testing.T) {
+	authSrv := newStaticAuthServer(t)
+	defer authSrv.Close()
+
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"responseId\":\"resp_s\",\"modelVersion\":\"gemini-3.5-flash\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}},\"thoughtSignature\":\"sig_stream\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n"))
+	}))
+	defer gateway.Close()
+
+	s, _ := NewServer(geminiTestConfig(gateway.URL, authSrv.URL))
+	reqBody := []byte(`{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"read_file","input_schema":{"type":"object"}}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"event: content_block_start", `"type":"tool_use"`, `"thought_signature":"sig_stream"`, `"stop_reason":"tool_use"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream tool response missing %q: %s", want, body)
 		}
 	}
 }
