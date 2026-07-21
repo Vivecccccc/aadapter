@@ -40,10 +40,8 @@ type authResponse struct {
 
 func newTokenProvider(cfg Config) *tokenProvider {
 	return &tokenProvider{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: cfg.AuthTimeout,
-		},
+		cfg:    cfg,
+		client: newHTTPClient(cfg.AuthTimeout),
 	}
 }
 
