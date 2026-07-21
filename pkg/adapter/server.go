@@ -49,7 +49,7 @@ func NewServer(cfg Config) (*Server, error) {
 	s := &Server{
 		cfg:     cfg,
 		tokens:  newTokenProvider(cfg),
-		gateway: &http.Client{Timeout: cfg.GatewayTimeout},
+		gateway: newHTTPClient(cfg.GatewayTimeout),
 		logger:  NewLogger(cfg.LogLevel, cfg.Verbose),
 
 		thoughtSignatures: map[string]string{},
