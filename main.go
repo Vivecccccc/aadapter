@@ -40,6 +40,9 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.RequestReadTimeout,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	log.Printf("adapter listening on %s (log_level=%s verbose=%t)", cfg.ListenAddr, cfg.LogLevel, cfg.Verbose)

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestMessagesProxyAndTokenRefresh(t *testing.T) {
@@ -87,6 +88,54 @@ func TestMessagesProxyAndTokenRefresh(t *testing.T) {
 	if atomic.LoadInt32(&authCalls) != 1 {
 		t.Fatalf("expected one auth call")
 	}
+}
+
+func TestAdapterSecurityAndErrorBoundaries(t *testing.T) {
+	t.Run("request body limit", func(t *testing.T) {
+		cfg := Config{LogLevel: "error", MaxRequestBodyBytes: 8, GatewayTimeout: time.Second, AuthTimeout: time.Second}
+		s, err := NewServer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"messages":[]}`))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge || !bytes.Contains(rec.Body.Bytes(), []byte(`"type":"error"`)) {
+			t.Fatalf("unexpected limited response status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("adapter API key", func(t *testing.T) {
+		cfg := Config{LogLevel: "error", AdapterAPIKey: "secret", GatewayTimeout: time.Second, AuthTimeout: time.Second}
+		s, err := NewServer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{}`))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+	})
+
+	t.Run("upstream Gemini error conversion", func(t *testing.T) {
+		authSrv := newStaticAuthServer(t)
+		defer authSrv.Close()
+		gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"quota exhausted","status":"RESOURCE_EXHAUSTED"}}`))
+		}))
+		defer gateway.Close()
+		cfg := geminiTestConfig(gateway.URL, authSrv.URL)
+		s, _ := NewServer(cfg)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hi"}]}`))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests || !bytes.Contains(rec.Body.Bytes(), []byte(`"type":"rate_limit_error"`)) {
+			t.Fatalf("unexpected upstream error status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 func TestAnthropicVersionAlwaysUsesEnvConfig(t *testing.T) {

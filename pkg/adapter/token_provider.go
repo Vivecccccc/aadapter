@@ -41,7 +41,7 @@ type authResponse struct {
 func newTokenProvider(cfg Config) *tokenProvider {
 	return &tokenProvider{
 		cfg:    cfg,
-		client: newHTTPClient(cfg.AuthTimeout),
+		client: newHTTPClient(cfg.AuthTimeout, cfg.InsecureSkipTLSVerify, false),
 	}
 }
 
@@ -55,24 +55,32 @@ func (p *tokenProvider) GetBearerToken(ctx context.Context) (string, error) {
 		return tok, nil
 	}
 
-	v, err, _ := p.sf.Do("refresh", func() (interface{}, error) {
-		return p.refresh(ctx)
-	})
-	if err != nil {
-		return "", err
-	}
-	return v.(string), nil
+	return p.refreshSingleflight(ctx)
 }
 
-func (p *tokenProvider) ForceRefresh(ctx context.Context) (string, error) {
-	p.sf.Forget("refresh")
-	v, err, _ := p.sf.Do("refresh", func() (interface{}, error) {
-		return p.refresh(ctx)
-	})
-	if err != nil {
-		return "", err
+func (p *tokenProvider) RefreshAfterRejection(ctx context.Context, rejected string) (string, error) {
+	p.mu.RLock()
+	current := p.bearer
+	p.mu.RUnlock()
+	if current != "" && current != rejected {
+		return current, nil
 	}
-	return v.(string), nil
+	return p.refreshSingleflight(ctx)
+}
+
+func (p *tokenProvider) refreshSingleflight(ctx context.Context) (string, error) {
+	resultCh := p.sf.DoChan("refresh", func() (interface{}, error) {
+		return p.refresh(context.WithoutCancel(ctx))
+	})
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return "", result.Err
+		}
+		return result.Val.(string), nil
+	}
 }
 
 func (p *tokenProvider) refresh(ctx context.Context) (string, error) {
@@ -102,8 +110,12 @@ func (p *tokenProvider) refresh(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("auth request failed: status=%d", resp.StatusCode)
 	}
 
+	responseBody, err := readResponseBody(resp.Body, 1<<20)
+	if err != nil {
+		return "", fmt.Errorf("read auth response: %w", err)
+	}
 	var parsed authResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.Unmarshal(responseBody, &parsed); err != nil {
 		return "", fmt.Errorf("decode auth response: %w", err)
 	}
 	if parsed.IDToken == "" {

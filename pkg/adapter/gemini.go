@@ -2,22 +2,36 @@ package adapter
 
 import (
 	"bufio"
-	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
+	"path"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 const synthesizedToolIDPrefix = "gemini_synth_"
+const signatureCarrierPrefix = "aadapter-signature-v1:"
+
+var geminiFunctionNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`)
+var synthesizedIDCounter uint64
 
 func anthropicMessagesToGemini(body []byte) ([]byte, error) {
-	return anthropicMessagesToGeminiWithSignatures(body, nil)
+	return anthropicMessagesToGeminiForModel(body, nil, "")
 }
 
 func anthropicMessagesToGeminiWithSignatures(body []byte, signatures map[string]string) ([]byte, error) {
+	return anthropicMessagesToGeminiForModel(body, signatures, "")
+}
+
+func anthropicMessagesToGeminiForModel(body []byte, signatures map[string]string, model string) ([]byte, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, err
@@ -41,8 +55,14 @@ func anthropicMessagesToGeminiWithSignatures(body []byte, signatures map[string]
 		return nil, fmt.Errorf("messages must produce at least one Gemini content item")
 	}
 	dst["contents"] = contents
+	if model == "gemini-3.6-flash" {
+		last := contents[len(contents)-1].(map[string]interface{})
+		if last["role"] == "model" {
+			return nil, fmt.Errorf("gemini-3.6-flash does not support an assistant/model message as the final input turn")
+		}
+	}
 
-	if cfg, ok, err := buildGeminiGenerationConfig(src); err != nil {
+	if cfg, ok, err := buildGeminiGenerationConfigForModel(src, model); err != nil {
 		return nil, err
 	} else if ok {
 		dst["generationConfig"] = cfg
@@ -86,6 +106,9 @@ func validateGeminiTopLevelFields(src map[string]interface{}) error {
 		if !allowed[key] {
 			return fmt.Errorf("unsupported Anthropic field for Gemini conversion: %s", key)
 		}
+	}
+	if container, ok := src["container"]; ok && container != nil {
+		return fmt.Errorf("Anthropic container execution is not supported by Gemini conversion")
 	}
 	return nil
 }
@@ -158,6 +181,10 @@ func buildGeminiContents(src map[string]interface{}, signatures map[string]strin
 		return nil, fmt.Errorf("messages must be an array")
 	}
 	toolNameByID := map[string]string{}
+	mergedSignatures := make(map[string]string, len(signatures))
+	for key, signature := range signatures {
+		mergedSignatures[key] = signature
+	}
 	for _, item := range rawMessages {
 		message, ok := item.(map[string]interface{})
 		if !ok {
@@ -169,6 +196,12 @@ func buildGeminiContents(src map[string]interface{}, signatures map[string]strin
 		blocks, _ := message["content"].([]interface{})
 		for _, rawBlock := range blocks {
 			block, _ := rawBlock.(map[string]interface{})
+			if blockType, _ := block["type"].(string); blockType == "redacted_thinking" {
+				if key, signature, ok := decodeSignatureCarrier(stringOrEmpty(block["data"])); ok {
+					mergedSignatures[key] = signature
+				}
+				continue
+			}
 			if blockType, _ := block["type"].(string); blockType != "tool_use" {
 				continue
 			}
@@ -196,12 +229,20 @@ func buildGeminiContents(src map[string]interface{}, signatures map[string]strin
 		} else if role != "user" {
 			return nil, fmt.Errorf("unsupported message role for Gemini conversion: %s", role)
 		}
-		parts, err := convertAnthropicContentToGeminiParts(message["content"], role, toolNameByID, signatures)
+		parts, err := convertAnthropicContentToGeminiParts(message["content"], role, toolNameByID, mergedSignatures)
 		if err != nil {
 			return nil, err
 		}
 		if len(parts) == 0 {
 			continue
+		}
+		if len(contents) > 0 {
+			previous, _ := contents[len(contents)-1].(map[string]interface{})
+			if previous != nil && previous["role"] == geminiRole {
+				previousParts, _ := previous["parts"].([]interface{})
+				previous["parts"] = append(previousParts, parts...)
+				continue
+			}
 		}
 		contents = append(contents, map[string]interface{}{
 			"role":  geminiRole,
@@ -230,7 +271,15 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 			case "text":
 				text, _ := block["text"].(string)
 				if text != "" {
-					parts = append(parts, map[string]interface{}{"text": text})
+					part := map[string]interface{}{"text": text}
+					signature := thoughtSignature(block)
+					if signature == "" {
+						signature = signatures[textSignatureKey(text)]
+					}
+					if signature != "" {
+						part["thoughtSignature"] = signature
+					}
+					parts = append(parts, part)
 				}
 			case "image", "document":
 				part, err := anthropicMediaBlockToGeminiPart(block, blockType)
@@ -250,9 +299,13 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 				if id != "" {
 					toolNameByID[id] = name
 				}
+				input, err := objectMapOrEmpty(block["input"])
+				if err != nil {
+					return nil, fmt.Errorf("tool_use %q input: %w", name, err)
+				}
 				call := map[string]interface{}{
 					"name": name,
-					"args": objectOrEmpty(block["input"]),
+					"args": input,
 				}
 				if id != "" && !strings.HasPrefix(id, synthesizedToolIDPrefix) {
 					call["id"] = id
@@ -260,7 +313,10 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 				part := map[string]interface{}{"functionCall": call}
 				signature := thoughtSignature(block)
 				if signature == "" && id != "" {
-					signature = signatures[id]
+					signature = signatures[toolSignatureKey(id)]
+					if signature == "" {
+						signature = signatures[id]
+					}
 				}
 				if signature != "" {
 					part["thoughtSignature"] = signature
@@ -272,9 +328,13 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 				if name == "" {
 					return nil, fmt.Errorf("unable to resolve Gemini functionResponse.name for tool_use_id %q", toolUseID)
 				}
-				resp := map[string]interface{}{
-					"name":     name,
-					"response": normalizeToolResult(block["content"]),
+				response, mediaParts, err := normalizeToolResult(block)
+				if err != nil {
+					return nil, err
+				}
+				resp := map[string]interface{}{"name": name, "response": response}
+				if len(mediaParts) > 0 {
+					resp["parts"] = mediaParts
 				}
 				if toolUseID != "" && !strings.HasPrefix(toolUseID, synthesizedToolIDPrefix) {
 					resp["id"] = toolUseID
@@ -297,10 +357,34 @@ func anthropicMediaBlockToGeminiPart(block map[string]interface{}, blockType str
 		return nil, fmt.Errorf("%s block missing source", blockType)
 	}
 	sourceType, _ := source["type"].(string)
-	if sourceType != "base64" {
-		return nil, fmt.Errorf("Gemini conversion only supports base64 %s sources, got %q", blockType, sourceType)
+	if sourceType == "text" && blockType == "document" {
+		text, _ := source["data"].(string)
+		if text == "" {
+			return nil, fmt.Errorf("document text source missing data")
+		}
+		return map[string]interface{}{"text": text}, nil
 	}
 	mimeType, _ := source["media_type"].(string)
+	if sourceType == "url" {
+		uri, _ := source["url"].(string)
+		if uri == "" {
+			return nil, fmt.Errorf("%s URL source missing url", blockType)
+		}
+		parsed, err := url.Parse(uri)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "gs") {
+			return nil, fmt.Errorf("invalid %s URL source", blockType)
+		}
+		if mimeType == "" {
+			mimeType = mime.TypeByExtension(path.Ext(parsed.Path))
+		}
+		if mimeType == "" {
+			return nil, fmt.Errorf("%s URL source requires media_type when it cannot be inferred from the URL", blockType)
+		}
+		return map[string]interface{}{"fileData": map[string]interface{}{"mimeType": mimeType, "fileUri": uri}}, nil
+	}
+	if sourceType != "base64" {
+		return nil, fmt.Errorf("unsupported Gemini %s source type %q", blockType, sourceType)
+	}
 	if mimeType == "" {
 		if blockType == "document" {
 			mimeType = "application/pdf"
@@ -321,12 +405,22 @@ func anthropicMediaBlockToGeminiPart(block map[string]interface{}, blockType str
 }
 
 func buildGeminiGenerationConfig(src map[string]interface{}) (map[string]interface{}, bool, error) {
+	return buildGeminiGenerationConfigForModel(src, "")
+}
+
+func buildGeminiGenerationConfigForModel(src map[string]interface{}, model string) (map[string]interface{}, bool, error) {
 	cfg := map[string]interface{}{}
 	copyField(src, cfg, "max_tokens", "maxOutputTokens")
-	copyField(src, cfg, "temperature", "temperature")
-	copyField(src, cfg, "top_p", "topP")
-	copyField(src, cfg, "top_k", "topK")
-	copyField(src, cfg, "stop_sequences", "stopSequences")
+	if model != "gemini-3.6-flash" {
+		copyField(src, cfg, "temperature", "temperature")
+		copyField(src, cfg, "top_p", "topP")
+	}
+	if model != "gemini-3.5-flash" && model != "gemini-3.6-flash" {
+		copyField(src, cfg, "top_k", "topK")
+	}
+	if model != "gemini-3.5-flash" && model != "gemini-3.6-flash" {
+		copyField(src, cfg, "stop_sequences", "stopSequences")
+	}
 
 	level, ok, err := resolveGeminiThinkingLevel(src)
 	if err != nil {
@@ -354,7 +448,11 @@ func resolveGeminiThinkingLevel(src map[string]interface{}) (string, bool, error
 				return "", false, fmt.Errorf("unsupported output_config field for Gemini conversion: %s", key)
 			}
 		}
-		if effort, _ := outputConfig["effort"].(string); effort != "" {
+		if value, present := outputConfig["effort"]; present {
+			effort, ok := value.(string)
+			if !ok || effort == "" {
+				return "", false, fmt.Errorf("output_config.effort must be a non-empty string")
+			}
 			level, ok := mapEffortToGeminiThinkingLevel(effort)
 			if !ok {
 				return "", false, fmt.Errorf("unsupported output_config.effort for Gemini conversion: %s", effort)
@@ -406,24 +504,43 @@ func mapEffortToGeminiThinkingLevel(effort string) (string, bool) {
 }
 
 func buildGeminiTools(src map[string]interface{}) ([]interface{}, bool, error) {
-	rawTools, ok := src["tools"].([]interface{})
-	if !ok || len(rawTools) == 0 {
+	raw, present := src["tools"]
+	if !present {
+		return nil, false, nil
+	}
+	rawTools, ok := raw.([]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("tools must be an array")
+	}
+	if len(rawTools) == 0 {
 		return nil, false, nil
 	}
 	var declarations []interface{}
+	seenNames := map[string]bool{}
 	for _, rawTool := range rawTools {
 		tool, ok := rawTool.(map[string]interface{})
 		if !ok {
 			return nil, false, fmt.Errorf("tools entries must be objects")
 		}
-		if toolType, _ := tool["type"].(string); toolType == "BatchTool" {
+		toolType, _ := tool["type"].(string)
+		name, _ := tool["name"].(string)
+		if toolType == "BatchTool" || name == "BatchTool" {
 			continue
 		}
-		name, _ := tool["name"].(string)
-		if name == "" {
-			return nil, false, fmt.Errorf("tool missing name")
+		if toolType != "" && toolType != "custom" {
+			return nil, false, fmt.Errorf("unsupported Anthropic server tool type for Gemini conversion: %s", toolType)
 		}
-		schema := ensureObjectSchema(tool["input_schema"])
+		if !geminiFunctionNamePattern.MatchString(name) {
+			return nil, false, fmt.Errorf("invalid Gemini function name %q", name)
+		}
+		if seenNames[name] {
+			return nil, false, fmt.Errorf("duplicate tool name %q", name)
+		}
+		seenNames[name] = true
+		schema, err := ensureObjectSchema(tool["input_schema"])
+		if err != nil {
+			return nil, false, fmt.Errorf("tool %q input_schema: %w", name, err)
+		}
 		declaration := map[string]interface{}{
 			"name":        name,
 			"description": stringOrEmpty(tool["description"]),
@@ -434,6 +551,9 @@ func buildGeminiTools(src map[string]interface{}) ([]interface{}, bool, error) {
 			declaration["parameters"] = schema
 		}
 		declarations = append(declarations, declaration)
+	}
+	if len(declarations) > 128 {
+		return nil, false, fmt.Errorf("Gemini 3.5/3.6 supports at most 128 function declarations")
 	}
 	if len(declarations) == 0 {
 		return nil, false, nil
@@ -457,6 +577,16 @@ func buildGeminiToolConfig(src map[string]interface{}) (map[string]interface{}, 
 			return nil, false, fmt.Errorf("unsupported tool_choice string for Gemini conversion: %s", v)
 		}
 	case map[string]interface{}:
+		for key := range v {
+			if key != "type" && key != "name" && key != "disable_parallel_tool_use" {
+				return nil, false, fmt.Errorf("unsupported tool_choice field for Gemini conversion: %s", key)
+			}
+		}
+		if disable, ok := v["disable_parallel_tool_use"].(bool); ok && disable {
+			return nil, false, fmt.Errorf("tool_choice.disable_parallel_tool_use=true cannot be enforced by Vertex Gemini")
+		} else if _, present := v["disable_parallel_tool_use"]; present && !ok {
+			return nil, false, fmt.Errorf("tool_choice.disable_parallel_tool_use must be a boolean")
+		}
 		choiceType, _ := v["type"].(string)
 		switch choiceType {
 		case "auto":
@@ -467,8 +597,8 @@ func buildGeminiToolConfig(src map[string]interface{}) (map[string]interface{}, 
 			return map[string]interface{}{"functionCallingConfig": map[string]interface{}{"mode": "ANY"}}, true, nil
 		case "tool":
 			name, _ := v["name"].(string)
-			if name == "" {
-				return nil, false, fmt.Errorf("tool_choice tool missing name")
+			if !geminiFunctionNamePattern.MatchString(name) {
+				return nil, false, fmt.Errorf("tool_choice tool has invalid name %q", name)
 			}
 			return map[string]interface{}{
 				"functionCallingConfig": map[string]interface{}{
@@ -490,11 +620,35 @@ func geminiResponseToAnthropic(body []byte) ([]byte, error) {
 }
 
 func geminiResponseToAnthropicWithSignatures(body []byte) ([]byte, map[string]string, error) {
+	return geminiResponseToAnthropicWithSignaturesAndStops(body, nil)
+}
+
+func geminiResponseToAnthropicWithSignaturesAndStops(body []byte, stopSequences []string) ([]byte, map[string]string, error) {
+	return geminiResponseToAnthropicWithDefaults(body, stopSequences, "")
+}
+
+func geminiResponseToAnthropicWithDefaults(body []byte, stopSequences []string, fallbackModel string) ([]byte, map[string]string, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, nil, err
 	}
+	if len(firstCandidate(src)) == 0 {
+		feedback, _ := src["promptFeedback"].(map[string]interface{})
+		if feedback == nil || stringOrEmpty(feedback["blockReason"]) == "" {
+			return nil, nil, fmt.Errorf("Gemini response contained no candidates")
+		}
+	}
+	if err := validateGeminiCandidate(firstCandidate(src)); err != nil {
+		return nil, nil, err
+	}
 	response, signatures := geminiObjectToAnthropicWithSignatures(src)
+	if stringOrEmpty(response["id"]) == "" {
+		response["id"] = synthesizeMessageID()
+	}
+	if stringOrEmpty(response["model"]) == "" {
+		response["model"] = fallbackModel
+	}
+	applyAnthropicStopSequences(response, stopSequences)
 	converted, err := json.Marshal(response)
 	if err != nil {
 		return nil, nil, err
@@ -533,8 +687,22 @@ func geminiObjectToAnthropicWithSignatures(src map[string]interface{}) (map[stri
 			if thought, _ := part["thought"].(bool); thought {
 				continue
 			}
-			if text, _ := part["text"].(string); text != "" {
-				content = append(content, map[string]interface{}{"type": "text", "text": text})
+			if text, hasText := part["text"].(string); hasText && text != "" {
+				block := map[string]interface{}{"type": "text", "text": text}
+				if signature := thoughtSignature(part); signature != "" {
+					block["thought_signature"] = signature
+					signatures[textSignatureKey(text)] = signature
+				}
+				content = append(content, block)
+			} else if hasText {
+				if signature := thoughtSignature(part); signature != "" && len(content) > 0 {
+					previous, _ := content[len(content)-1].(map[string]interface{})
+					if previous != nil && stringOrEmpty(previous["type"]) == "text" {
+						previous["thought_signature"] = signature
+						key := textSignatureKey(stringOrEmpty(previous["text"]))
+						signatures[key] = signature
+					}
+				}
 			}
 			if call, _ := part["functionCall"].(map[string]interface{}); call != nil {
 				hasToolUse = true
@@ -550,7 +718,10 @@ func geminiObjectToAnthropicWithSignatures(src map[string]interface{}) (map[stri
 				}
 				if signature := thoughtSignature(part); signature != "" {
 					block["thought_signature"] = signature
-					signatures[id] = signature
+					signatures[toolSignatureKey(id)] = signature
+				}
+				if signature := thoughtSignature(part); signature != "" {
+					content = append(content, signatureCarrierBlock(toolSignatureKey(id), signature))
 				}
 				content = append(content, block)
 			}
@@ -566,6 +737,54 @@ func geminiObjectToAnthropicWithSignatures(src map[string]interface{}) (map[stri
 		"stop_sequence": nil,
 		"usage":         buildAnthropicUsage(src["usageMetadata"]),
 	}, signatures
+}
+
+func validateGeminiCandidate(candidate map[string]interface{}) error {
+	if len(candidate) == 0 {
+		return nil
+	}
+	contentValue, present := candidate["content"]
+	if !present {
+		return nil
+	}
+	content, ok := contentValue.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("Gemini candidate content must be an object")
+	}
+	partsValue, present := content["parts"]
+	if !present {
+		return nil
+	}
+	parts, ok := partsValue.([]interface{})
+	if !ok {
+		return fmt.Errorf("Gemini candidate parts must be an array")
+	}
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("Gemini candidate part must be an object")
+		}
+		if value, present := part["text"]; present {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("Gemini text part must contain a string")
+			}
+		}
+		if value, present := part["functionCall"]; present {
+			call, ok := value.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("Gemini functionCall must be an object")
+			}
+			if stringOrEmpty(call["name"]) == "" {
+				return fmt.Errorf("Gemini functionCall missing name")
+			}
+			if args, present := call["args"]; present && args != nil {
+				if _, ok := args.(map[string]interface{}); !ok {
+					return fmt.Errorf("Gemini functionCall args must be an object")
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func firstCandidate(src map[string]interface{}) map[string]interface{} {
@@ -585,7 +804,9 @@ func mapGeminiFinishReason(value interface{}, hasToolUse bool) string {
 	switch reason {
 	case "MAX_TOKENS":
 		return "max_tokens"
-	case "SAFETY", "RECITATION", "SPII", "BLOCKLIST", "PROHIBITED_CONTENT":
+	case "SAFETY", "RECITATION", "LANGUAGE", "OTHER", "SPII", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY",
+		"IMAGE_PROHIBITED_CONTENT", "MODEL_ARMOR", "JAILBREAK", "MALFORMED_FUNCTION_CALL",
+		"UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "NO_IMAGE", "IMAGE_RECITATION", "IMAGE_OTHER":
 		return "refusal"
 	default:
 		if hasToolUse {
@@ -630,41 +851,176 @@ func geminiCountTokensToAnthropic(body []byte) ([]byte, error) {
 	return json.Marshal(map[string]interface{}{"input_tokens": total})
 }
 
-func (s *Server) streamGeminiAsAnthropic(w http.ResponseWriter, r io.Reader) ([]byte, int) {
+func (s *Server) streamGeminiAsAnthropic(w http.ResponseWriter, r io.Reader, sessionID string, stopSequences []string, fallbackModel string) (string, int, error) {
 	flusher, _ := w.(http.Flusher)
-	captured := bytes.NewBuffer(nil)
-	writeEvent := func(event string, payload map[string]interface{}) {
-		line, _ := json.Marshal(payload)
+	captured := newCappedBuffer(s.cfg.MaxDebugCaptureBytes)
+	written := 0
+	writeEvent := func(event string, payload map[string]interface{}) error {
+		line, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
 		chunk := []byte("event: " + event + "\ndata: " + string(line) + "\n\n")
-		_, _ = w.Write(chunk)
-		_, _ = captured.Write(chunk)
+		n, err := w.Write(chunk)
+		written += n
+		_, _ = captured.Write(chunk[:n])
 		if flusher != nil {
 			flusher.Flush()
 		}
+		return err
 	}
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-	var dataLines []string
 	started := false
-	messageID := ""
-	model := ""
-	accumulatedText := ""
-	textOpen := false
-	textIndex := 0
+	messageID, model := "", ""
 	nextIndex := 0
-	var latestUsage interface{}
-	var latestFinish interface{}
-	var toolUses []map[string]interface{}
-	toolIDByKey := map[string]string{}
+	textOpen, textIndex := false, 0
+	currentText := strings.Builder{}
+	currentTextSignature := ""
+	var latestUsage, latestFinish interface{}
+	hasToolUse := false
+	stopFilter := newTextStopFilter(stopSequences)
+	matchedStop := ""
+	emittedCalls := map[string]int{}
+	var outputErr error
 
-	processData := func(data string) {
+	startMessage := func() error {
+		if started {
+			return nil
+		}
+		started = true
+		if messageID == "" {
+			messageID = synthesizeMessageID()
+		}
+		if model == "" {
+			model = fallbackModel
+		}
+		return writeEvent("message_start", map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id": messageID, "type": "message", "role": "assistant", "content": []interface{}{},
+				"model": model, "stop_reason": nil, "stop_sequence": nil, "usage": buildAnthropicUsage(latestUsage),
+			},
+		})
+	}
+	closeText := func() error {
+		if !textOpen {
+			return nil
+		}
+		key := textSignatureKey(currentText.String())
+		if currentTextSignature != "" {
+			s.signatures.remember(sessionID, map[string]string{key: currentTextSignature})
+		}
+		if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": textIndex}); err != nil {
+			return err
+		}
+		currentText.Reset()
+		currentTextSignature = ""
+		textOpen = false
+		return nil
+	}
+	emitText := func(text, signature string) error {
+		if text == "" {
+			return nil
+		}
+		text, matched := stopFilter.Feed(text)
+		if matched != "" {
+			matchedStop = matched
+		}
+		if text == "" {
+			return nil
+		}
+		if err := startMessage(); err != nil {
+			return err
+		}
+		if !textOpen {
+			textIndex = nextIndex
+			nextIndex++
+			block := map[string]interface{}{"type": "text", "text": ""}
+			if signature != "" {
+				block["thought_signature"] = signature
+			}
+			if err := writeEvent("content_block_start", map[string]interface{}{"type": "content_block_start", "index": textIndex, "content_block": block}); err != nil {
+				return err
+			}
+			textOpen = true
+		}
+		currentText.WriteString(text)
+		if signature != "" {
+			currentTextSignature = signature
+		}
+		return writeEvent("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": textIndex, "delta": map[string]interface{}{"type": "text_delta", "text": text}})
+	}
+	emitTool := func(call, part map[string]interface{}) error {
+		if matchedStop != "" {
+			return nil
+		}
+		if err := startMessage(); err != nil {
+			return err
+		}
+		if err := closeText(); err != nil {
+			return err
+		}
+		id := stringOrEmpty(call["id"])
+		if id == "" {
+			id = synthesizeToolID()
+		}
+		name := stringOrEmpty(call["name"])
+		if name == "" {
+			return fmt.Errorf("Gemini functionCall missing name")
+		}
+		input := objectOrEmpty(call["args"])
+		signature := thoughtSignature(part)
+		if signature != "" {
+			s.signatures.remember(sessionID, map[string]string{toolSignatureKey(id): signature})
+		}
+		if signature != "" {
+			carrierIndex := nextIndex
+			nextIndex++
+			carrier := signatureCarrierBlock(toolSignatureKey(id), signature)
+			if err := writeEvent("content_block_start", map[string]interface{}{"type": "content_block_start", "index": carrierIndex, "content_block": carrier}); err != nil {
+				return err
+			}
+			if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": carrierIndex}); err != nil {
+				return err
+			}
+		}
+		index := nextIndex
+		nextIndex++
+		block := map[string]interface{}{"type": "tool_use", "id": id, "name": name, "input": map[string]interface{}{}}
+		if signature != "" {
+			block["thought_signature"] = signature
+		}
+		if err := writeEvent("content_block_start", map[string]interface{}{"type": "content_block_start", "index": index, "content_block": block}); err != nil {
+			return err
+		}
+		partial, err := json.Marshal(input)
+		if err != nil {
+			return err
+		}
+		if err := writeEvent("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": index, "delta": map[string]interface{}{"type": "input_json_delta", "partial_json": string(partial)}}); err != nil {
+			return err
+		}
+		if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": index}); err != nil {
+			return err
+		}
+		hasToolUse = true
+		return nil
+	}
+
+	processData := func(data string) error {
 		if strings.TrimSpace(data) == "" || strings.TrimSpace(data) == "[DONE]" {
-			return
+			return nil
 		}
 		var chunk map[string]interface{}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			return
+			return fmt.Errorf("decode Gemini SSE event: %w", err)
+		}
+		if upstreamError, _ := chunk["error"].(map[string]interface{}); upstreamError != nil {
+			message := stringOrEmpty(upstreamError["message"])
+			if message == "" {
+				message = "Gemini stream returned an error"
+			}
+			return fmt.Errorf("Gemini stream error: %s", message)
 		}
 		if messageID == "" {
 			messageID = stringOrEmpty(chunk["responseId"])
@@ -675,143 +1031,219 @@ func (s *Server) streamGeminiAsAnthropic(w http.ResponseWriter, r io.Reader) ([]
 		if usage, ok := chunk["usageMetadata"]; ok {
 			latestUsage = usage
 		}
-		if !started {
-			writeEvent("message_start", map[string]interface{}{
-				"type": "message_start",
-				"message": map[string]interface{}{
-					"id":    messageID,
-					"type":  "message",
-					"role":  "assistant",
-					"model": model,
-					"usage": buildAnthropicUsage(latestUsage),
-				},
-			})
-			started = true
+		if feedback, _ := chunk["promptFeedback"].(map[string]interface{}); feedback != nil {
+			if reason := stringOrEmpty(feedback["blockReason"]); reason != "" {
+				latestFinish = "SAFETY"
+				return emitText("Request blocked by Gemini safety filters: "+reason, "")
+			}
 		}
 		candidate := firstCandidate(chunk)
+		if err := validateGeminiCandidate(candidate); err != nil {
+			return err
+		}
 		if finish, ok := candidate["finishReason"]; ok {
 			latestFinish = finish
 		}
 		content, _ := candidate["content"].(map[string]interface{})
 		parts, _ := content["parts"].([]interface{})
-		visibleText := strings.Builder{}
+		chunkOccurrences := map[string]int{}
 		for _, rawPart := range parts {
-			part, _ := rawPart.(map[string]interface{})
+			part, ok := rawPart.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("Gemini SSE part must be an object")
+			}
 			if thought, _ := part["thought"].(bool); thought {
 				continue
 			}
-			if text, _ := part["text"].(string); text != "" {
-				visibleText.WriteString(text)
+			if text := stringOrEmpty(part["text"]); text != "" {
+				if err := emitText(text, thoughtSignature(part)); err != nil {
+					return err
+				}
+			} else if _, hasText := part["text"]; hasText && thoughtSignature(part) != "" && textOpen {
+				currentTextSignature = thoughtSignature(part)
 			}
 			if call, _ := part["functionCall"].(map[string]interface{}); call != nil {
-				id, _ := call["id"].(string)
-				if id == "" {
-					key := stableToolCallKey(call)
-					id = toolIDByKey[key]
-					if id == "" {
-						id = synthesizeToolID()
-						toolIDByKey[key] = id
-					}
+				fingerprint := stableToolCallKey(call) + ":" + thoughtSignature(part)
+				chunkOccurrences[fingerprint]++
+				if chunkOccurrences[fingerprint] <= emittedCalls[fingerprint] {
+					continue
 				}
-				signature := thoughtSignature(part)
-				if signature != "" {
-					s.rememberThoughtSignatures(map[string]string{id: signature})
+				if err := emitTool(call, part); err != nil {
+					return err
 				}
-				toolUses = append(toolUses, map[string]interface{}{
-					"id":                id,
-					"name":              stringOrEmpty(call["name"]),
-					"input":             objectOrEmpty(call["args"]),
-					"thought_signature": signature,
-				})
+				emittedCalls[fingerprint] = chunkOccurrences[fingerprint]
 			}
 		}
-		text := visibleText.String()
-		if text != "" {
-			delta := text
-			if strings.HasPrefix(text, accumulatedText) {
-				delta = text[len(accumulatedText):]
-				accumulatedText = text
-			} else {
-				accumulatedText += text
-			}
-			if delta != "" {
-				if !textOpen {
-					textIndex = nextIndex
-					nextIndex++
-					writeEvent("content_block_start", map[string]interface{}{
-						"type":          "content_block_start",
-						"index":         textIndex,
-						"content_block": map[string]interface{}{"type": "text", "text": ""},
-					})
-					textOpen = true
-				}
-				writeEvent("content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": textIndex,
-					"delta": map[string]interface{}{"type": "text_delta", "text": delta},
-				})
-			}
-		}
+		return nil
 	}
 
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), s.cfg.MaxStreamEventBytes)
+	var dataLines []string
+	eventBytes := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
 			if len(dataLines) > 0 {
-				processData(strings.Join(dataLines, "\n"))
+				if err := processData(strings.Join(dataLines, "\n")); err != nil {
+					outputErr = err
+					break
+				}
 				dataLines = nil
+				eventBytes = 0
 			}
 			continue
 		}
 		if data, ok := strings.CutPrefix(line, "data:"); ok {
-			dataLines = append(dataLines, strings.TrimSpace(data))
+			data = strings.TrimSpace(data)
+			eventBytes += len(data)
+			if eventBytes > s.cfg.MaxStreamEventBytes {
+				outputErr = fmt.Errorf("Gemini SSE event exceeds configured size limit")
+				break
+			}
+			dataLines = append(dataLines, data)
 		}
 	}
-	if len(dataLines) > 0 {
-		processData(strings.Join(dataLines, "\n"))
+	if outputErr == nil && len(dataLines) > 0 {
+		outputErr = processData(strings.Join(dataLines, "\n"))
 	}
-	if !started {
-		writeEvent("message_start", map[string]interface{}{
-			"type":    "message_start",
-			"message": map[string]interface{}{"id": messageID, "type": "message", "role": "assistant", "model": model, "usage": buildAnthropicUsage(latestUsage)},
-		})
+	if outputErr == nil {
+		outputErr = scanner.Err()
 	}
-	if textOpen {
-		writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": textIndex})
+	if outputErr != nil {
+		_ = writeEvent("error", map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": outputErr.Error()}})
+		return captured.String(), written, outputErr
 	}
-	seenTools := map[string]bool{}
-	for _, tool := range toolUses {
-		key := stringOrEmpty(tool["id"]) + ":" + stringOrEmpty(tool["name"])
-		if seenTools[key] {
+	if matchedStop == "" {
+		if tail := stopFilter.Flush(); tail != "" {
+			sequences := stopFilter.sequences
+			stopFilter.sequences = nil
+			if err := emitText(tail, ""); err != nil {
+				return captured.String(), written, err
+			}
+			stopFilter.sequences = sequences
+		}
+	}
+	if err := startMessage(); err != nil {
+		return captured.String(), written, err
+	}
+	if err := closeText(); err != nil {
+		return captured.String(), written, err
+	}
+	usage := buildAnthropicUsage(latestUsage)
+	stopReason := mapGeminiFinishReason(latestFinish, hasToolUse)
+	var stopSequence interface{}
+	if matchedStop != "" {
+		stopReason, stopSequence = "stop_sequence", matchedStop
+	}
+	if err := writeEvent("message_delta", map[string]interface{}{
+		"type":  "message_delta",
+		"delta": map[string]interface{}{"stop_reason": stopReason, "stop_sequence": stopSequence},
+		"usage": map[string]interface{}{"output_tokens": usage["output_tokens"]},
+	}); err != nil {
+		return captured.String(), written, err
+	}
+	if err := writeEvent("message_stop", map[string]interface{}{"type": "message_stop"}); err != nil {
+		return captured.String(), written, err
+	}
+	return captured.String(), written, nil
+}
+
+func applyAnthropicStopSequences(response map[string]interface{}, sequences []string) {
+	if len(sequences) == 0 {
+		return
+	}
+	blocks, _ := response["content"].([]interface{})
+	filter := newTextStopFilter(sequences)
+	result := make([]interface{}, 0, len(blocks))
+	for _, rawBlock := range blocks {
+		block, _ := rawBlock.(map[string]interface{})
+		if block == nil || stringOrEmpty(block["type"]) != "text" {
+			if tail := filter.Flush(); tail != "" && len(result) > 0 {
+				if previous, _ := result[len(result)-1].(map[string]interface{}); stringOrEmpty(previous["type"]) == "text" {
+					previous["text"] = stringOrEmpty(previous["text"]) + tail
+				}
+			}
+			result = append(result, rawBlock)
 			continue
 		}
-		seenTools[key] = true
-		index := nextIndex
-		nextIndex++
-		block := map[string]interface{}{"type": "tool_use", "id": tool["id"], "name": tool["name"]}
-		if signature := stringOrEmpty(tool["thought_signature"]); signature != "" {
-			block["thought_signature"] = signature
+		text := stringOrEmpty(block["text"])
+		visible, matched := filter.Feed(text)
+		copyBlock := make(map[string]interface{}, len(block))
+		for key, value := range block {
+			copyBlock[key] = value
 		}
-		writeEvent("content_block_start", map[string]interface{}{
-			"type":          "content_block_start",
-			"index":         index,
-			"content_block": block,
-		})
-		partial, _ := json.Marshal(tool["input"])
-		writeEvent("content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": index,
-			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": string(partial)},
-		})
-		writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": index})
+		copyBlock["text"] = visible
+		result = append(result, copyBlock)
+		if matched != "" {
+			response["content"] = result
+			response["stop_reason"] = "stop_sequence"
+			response["stop_sequence"] = matched
+			return
+		}
 	}
-	writeEvent("message_delta", map[string]interface{}{
-		"type":  "message_delta",
-		"delta": map[string]interface{}{"stop_reason": mapGeminiFinishReason(latestFinish, len(toolUses) > 0), "stop_sequence": nil},
-		"usage": buildAnthropicUsage(latestUsage),
-	})
-	writeEvent("message_stop", map[string]interface{}{"type": "message_stop"})
-	return captured.Bytes(), captured.Len()
+	if tail := filter.Flush(); tail != "" && len(result) > 0 {
+		if previous, _ := result[len(result)-1].(map[string]interface{}); stringOrEmpty(previous["type"]) == "text" {
+			previous["text"] = stringOrEmpty(previous["text"]) + tail
+		}
+	}
+	response["content"] = result
+}
+
+func earliestStop(text string, sequences []string) (int, string) {
+	best := -1
+	matched := ""
+	for _, sequence := range sequences {
+		if sequence == "" {
+			continue
+		}
+		if index := strings.Index(text, sequence); index >= 0 && (best < 0 || index < best) {
+			best, matched = index, sequence
+		}
+	}
+	return best, matched
+}
+
+type textStopFilter struct {
+	sequences []string
+	pending   string
+	stopped   bool
+}
+
+func newTextStopFilter(sequences []string) *textStopFilter {
+	return &textStopFilter{sequences: sequences}
+}
+
+func (f *textStopFilter) Feed(text string) (string, string) {
+	if f.stopped {
+		return "", ""
+	}
+	combined := f.pending + text
+	if index, matched := earliestStop(combined, f.sequences); index >= 0 {
+		f.pending = ""
+		f.stopped = true
+		return combined[:index], matched
+	}
+	keep := 0
+	for _, sequence := range f.sequences {
+		for length := 1; length < len(sequence) && length <= len(combined); length++ {
+			if strings.HasSuffix(combined, sequence[:length]) && length > keep {
+				keep = length
+			}
+		}
+	}
+	output := combined[:len(combined)-keep]
+	f.pending = combined[len(combined)-keep:]
+	return output, ""
+}
+
+func (f *textStopFilter) Flush() string {
+	if f.stopped {
+		return ""
+	}
+	text := f.pending
+	f.pending = ""
+	return text
 }
 
 func copyField(src, dst map[string]interface{}, from, to string) {
@@ -820,20 +1252,29 @@ func copyField(src, dst map[string]interface{}, from, to string) {
 	}
 }
 
-func ensureObjectSchema(value interface{}) map[string]interface{} {
-	schema, _ := value.(map[string]interface{})
-	if schema == nil {
+func ensureObjectSchema(value interface{}) (map[string]interface{}, error) {
+	if value == nil {
+		schema := map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+		return schema, nil
+	}
+	schema, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	if len(schema) == 0 {
 		schema = map[string]interface{}{}
 	}
 	if _, ok := schema["type"]; !ok {
 		schema["type"] = "object"
 	}
-	if schema["type"] == "object" {
+	if schemaType, ok := schema["type"].(string); !ok || schemaType != "object" {
+		return nil, fmt.Errorf("top-level type must be object")
+	} else {
 		if _, ok := schema["properties"]; !ok {
 			schema["properties"] = map[string]interface{}{}
 		}
 	}
-	return schema
+	return schema, nil
 }
 
 func requiresGeminiParametersJSONSchema(schema interface{}) bool {
@@ -905,30 +1346,64 @@ func thoughtSignature(value map[string]interface{}) string {
 	return stringOrEmpty(value["thought_signature"])
 }
 
-func normalizeToolResult(value interface{}) map[string]interface{} {
+func normalizeToolResult(block map[string]interface{}) (map[string]interface{}, []interface{}, error) {
+	value := block["content"]
+	isError := false
+	if raw, present := block["is_error"]; present {
+		var ok bool
+		isError, ok = raw.(bool)
+		if !ok {
+			return nil, nil, fmt.Errorf("tool_result is_error must be a boolean")
+		}
+	}
+	responseKey := "output"
+	if isError {
+		responseKey = "error"
+	}
+	var content interface{}
+	var mediaParts []interface{}
 	switch v := value.(type) {
 	case string:
-		return map[string]interface{}{"content": v}
+		content = v
 	case []interface{}:
 		var texts []string
 		for _, rawBlock := range v {
-			block, _ := rawBlock.(map[string]interface{})
-			if blockType, _ := block["type"].(string); blockType != "text" {
-				continue
+			contentBlock, ok := rawBlock.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("tool_result content blocks must be objects")
 			}
-			if text, _ := block["text"].(string); text != "" {
-				texts = append(texts, text)
+			switch blockType, _ := contentBlock["type"].(string); blockType {
+			case "text":
+				if text, _ := contentBlock["text"].(string); text != "" {
+					texts = append(texts, text)
+				}
+			case "image", "document":
+				part, err := anthropicMediaBlockToGeminiPart(contentBlock, blockType)
+				if err != nil {
+					return nil, nil, err
+				}
+				if inline, ok := part["inlineData"]; ok {
+					mediaParts = append(mediaParts, map[string]interface{}{"inlineData": inline})
+				} else if file, ok := part["fileData"]; ok {
+					mediaParts = append(mediaParts, map[string]interface{}{"fileData": file})
+				} else if text, ok := part["text"].(string); ok {
+					texts = append(texts, text)
+				}
+			default:
+				return nil, nil, fmt.Errorf("unsupported tool_result content block: %s", blockType)
 			}
 		}
 		if len(texts) > 0 {
-			return map[string]interface{}{"content": strings.Join(texts, "\n")}
+			content = strings.Join(texts, "\n")
+		} else {
+			content = ""
 		}
-		return map[string]interface{}{"content": v}
 	case nil:
-		return map[string]interface{}{"content": ""}
+		content = ""
 	default:
-		return map[string]interface{}{"content": v}
+		return nil, nil, fmt.Errorf("tool_result content must be a string or content block array")
 	}
+	return map[string]interface{}{responseKey: content}, mediaParts, nil
 }
 
 func objectOrEmpty(value interface{}) interface{} {
@@ -938,13 +1413,64 @@ func objectOrEmpty(value interface{}) interface{} {
 	return value
 }
 
+func objectMapOrEmpty(value interface{}) (map[string]interface{}, error) {
+	if value == nil {
+		return map[string]interface{}{}, nil
+	}
+	object, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	return object, nil
+}
+
 func stringOrEmpty(value interface{}) string {
 	got, _ := value.(string)
 	return got
 }
 
 func synthesizeToolID() string {
-	return fmt.Sprintf("%s%d", synthesizedToolIDPrefix, time.Now().UnixNano())
+	return fmt.Sprintf("%s%d_%d", synthesizedToolIDPrefix, time.Now().UnixNano(), atomic.AddUint64(&synthesizedIDCounter, 1))
+}
+
+func synthesizeMessageID() string {
+	return fmt.Sprintf("msg_gemini_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&synthesizedIDCounter, 1))
+}
+
+func toolSignatureKey(id string) string { return "tool:" + id }
+
+func textSignatureKey(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("text:%x", sum[:])
+}
+
+type signatureCarrier struct {
+	Key       string `json:"key"`
+	Signature string `json:"signature"`
+}
+
+func signatureCarrierBlock(key, signature string) map[string]interface{} {
+	payload, _ := json.Marshal(signatureCarrier{Key: key, Signature: signature})
+	return map[string]interface{}{
+		"type": "redacted_thinking",
+		"data": signatureCarrierPrefix + base64.RawURLEncoding.EncodeToString(payload),
+	}
+}
+
+func decodeSignatureCarrier(data string) (string, string, bool) {
+	encoded, ok := strings.CutPrefix(data, signatureCarrierPrefix)
+	if !ok {
+		return "", "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", "", false
+	}
+	var carrier signatureCarrier
+	if json.Unmarshal(payload, &carrier) != nil || carrier.Key == "" || carrier.Signature == "" {
+		return "", "", false
+	}
+	return carrier.Key, carrier.Signature, true
 }
 
 func uint64Number(value interface{}) uint64 {

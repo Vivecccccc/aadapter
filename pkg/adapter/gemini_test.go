@@ -16,7 +16,7 @@ func TestGeminiMessagesTransformUsesVertexGenerateContent(t *testing.T) {
 	defer authSrv.Close()
 
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-3.5-flash:generateContent" {
+		if r.URL.Path != "/v1/projects/p/locations/global/publishers/google/models/gemini-3.5-flash:generateContent" {
 			t.Fatalf("unexpected Gemini path: %s", r.URL.Path)
 		}
 		if got := r.URL.RawQuery; got != "" {
@@ -136,12 +136,36 @@ func TestGeminiToolUseResponsePreservesThoughtSignature(t *testing.T) {
 	}
 	var got map[string]interface{}
 	_ = json.Unmarshal(converted, &got)
-	block := got["content"].([]interface{})[0].(map[string]interface{})
+	var block map[string]interface{}
+	for _, raw := range got["content"].([]interface{}) {
+		candidate := raw.(map[string]interface{})
+		if candidate["type"] == "tool_use" {
+			block = candidate
+			break
+		}
+	}
+	if block == nil {
+		t.Fatalf("missing tool_use block: %s", converted)
+	}
 	if block["type"] != "tool_use" || block["thought_signature"] != "sig_a" {
 		t.Fatalf("tool_use thought_signature mismatch: %s", string(converted))
 	}
 	if id, _ := block["id"].(string); !strings.HasPrefix(id, synthesizedToolIDPrefix) {
 		t.Fatalf("expected synthesized tool_use id, got: %s", string(converted))
+	}
+	request, _ := json.Marshal(map[string]interface{}{
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "read it"},
+			map[string]interface{}{"role": "assistant", "content": got["content"]},
+			map[string]interface{}{"role": "user", "content": []interface{}{map[string]interface{}{"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}}},
+		},
+	})
+	rewritten, err := anthropicMessagesToGeminiForModel(request, nil, "gemini-3.5-flash")
+	if err != nil {
+		t.Fatalf("stateless signature round-trip failed: %v", err)
+	}
+	if !bytes.Contains(rewritten, []byte(`"thoughtSignature":"sig_a"`)) {
+		t.Fatalf("signature carrier was not restored without server state: %s", rewritten)
 	}
 }
 
@@ -198,6 +222,7 @@ func TestGeminiServerRestoresStoredThoughtSignatureWhenClaudeDropsIt(t *testing.
 		"messages":[{"role":"user","content":"run pwd"}],
 		"tools":[{"name":"Bash","input_schema":{"type":"object"}}]
 	}`)))
+	firstReq.Header.Set(claudeCodeSessionHeader, "session-a")
 	firstRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(firstRec, firstReq)
 	if firstRec.Code != http.StatusOK {
@@ -205,7 +230,17 @@ func TestGeminiServerRestoresStoredThoughtSignatureWhenClaudeDropsIt(t *testing.
 	}
 	var firstResp map[string]interface{}
 	_ = json.Unmarshal(firstRec.Body.Bytes(), &firstResp)
-	firstBlock := firstResp["content"].([]interface{})[0].(map[string]interface{})
+	var firstBlock map[string]interface{}
+	for _, raw := range firstResp["content"].([]interface{}) {
+		candidate := raw.(map[string]interface{})
+		if candidate["type"] == "tool_use" {
+			firstBlock = candidate
+			break
+		}
+	}
+	if firstBlock == nil {
+		t.Fatalf("first response missing tool_use: %s", firstRec.Body.String())
+	}
 	firstToolID = firstBlock["id"].(string)
 	if firstBlock["thought_signature"] != "sig_server" {
 		t.Fatalf("first response missing thought_signature: %s", firstRec.Body.String())
@@ -221,6 +256,7 @@ func TestGeminiServerRestoresStoredThoughtSignatureWhenClaudeDropsIt(t *testing.
 		"tools":[{"name":"Bash","input_schema":{"type":"object"}}]
 	}`)
 	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	secondReq.Header.Set(claudeCodeSessionHeader, "session-a")
 	secondRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(secondRec, secondReq)
 	if secondRec.Code != http.StatusOK {
@@ -252,7 +288,7 @@ func TestGeminiStreamGenerateContentConvertsToAnthropicSSE(t *testing.T) {
 	defer authSrv.Close()
 
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-3.5-flash:streamGenerateContent" {
+		if r.URL.Path != "/v1/projects/p/locations/global/publishers/google/models/gemini-3.5-flash:streamGenerateContent" {
 			t.Fatalf("unexpected stream path: %s", r.URL.Path)
 		}
 		if got := r.URL.Query().Get("alt"); got != "sse" {
@@ -260,7 +296,7 @@ func TestGeminiStreamGenerateContentConvertsToAnthropicSSE(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"responseId\":\"resp_s\",\"modelVersion\":\"gemini-3.5-flash\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"he\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":3}}\n\n"))
-		_, _ = w.Write([]byte("data: {\"responseId\":\"resp_s\",\"modelVersion\":\"gemini-3.5-flash\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"hello\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"responseId\":\"resp_s\",\"modelVersion\":\"gemini-3.5-flash\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"llo\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n"))
 	}))
 	defer gateway.Close()
 
@@ -273,7 +309,7 @@ func TestGeminiStreamGenerateContentConvertsToAnthropicSSE(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"event: message_start", "text_delta", `"text":"he"`, `"text":"llo"`, "event: message_delta", `"stop_reason":"end_turn"`, "event: message_stop"} {
+	for _, want := range []string{"event: message_start", `"content":[]`, `"stop_reason":null`, "text_delta", `"text":"he"`, `"text":"llo"`, "event: message_delta", `"stop_reason":"end_turn"`, "event: message_stop"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("stream response missing %q: %s", want, body)
 		}
@@ -286,7 +322,7 @@ func TestGeminiStreamPreservesToolUseThoughtSignature(t *testing.T) {
 
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"responseId\":\"resp_s\",\"modelVersion\":\"gemini-3.5-flash\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}},\"thoughtSignature\":\"sig_stream\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"responseId\":\"resp_s\",\"modelVersion\":\"gemini-3.5-flash\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}},\"thoughtSignature\":\"sig_stream\"},{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n"))
 	}))
 	defer gateway.Close()
 
@@ -299,10 +335,153 @@ func TestGeminiStreamPreservesToolUseThoughtSignature(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"event: content_block_start", `"type":"tool_use"`, `"thought_signature":"sig_stream"`, `"stop_reason":"tool_use"`} {
+	for _, want := range []string{"event: content_block_start", `"type":"tool_use"`, `"input":{}`, `"thought_signature":"sig_stream"`, `"stop_reason":"tool_use"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("stream tool response missing %q: %s", want, body)
 		}
+	}
+	if got := strings.Count(body, `"type":"tool_use"`); got != 2 {
+		t.Fatalf("expected two parallel tool calls, got %d: %s", got, body)
+	}
+}
+
+func TestGemini35And36ModelSpecificRequestRules(t *testing.T) {
+	body := []byte(`{
+		"messages":[{"role":"user","content":"hello"}],
+		"max_tokens":100,"temperature":0.2,"top_p":0.8,"top_k":12,"stop_sequences":["END"]
+	}`)
+	for _, model := range []string{"gemini-3.5-flash", "gemini-3.6-flash"} {
+		rewritten, err := anthropicMessagesToGeminiForModel(body, nil, model)
+		if err != nil {
+			t.Fatalf("%s rewrite failed: %v", model, err)
+		}
+		var got map[string]interface{}
+		_ = json.Unmarshal(rewritten, &got)
+		cfg := got["generationConfig"].(map[string]interface{})
+		for _, forbidden := range []string{"topK", "stopSequences"} {
+			if _, ok := cfg[forbidden]; ok {
+				t.Fatalf("%s must not forward %s: %s", model, forbidden, rewritten)
+			}
+		}
+		if model == "gemini-3.5-flash" {
+			if cfg["temperature"] != 0.2 || cfg["topP"] != 0.8 {
+				t.Fatalf("Gemini 3.5 must preserve supported sampling controls: %s", rewritten)
+			}
+		} else if _, hasTemperature := cfg["temperature"]; hasTemperature {
+			t.Fatalf("Gemini 3.6 must omit custom sampling controls: %s", rewritten)
+		}
+	}
+	_, err := anthropicMessagesToGeminiForModel([]byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"prefill"}]}`), nil, "gemini-3.6-flash")
+	if err == nil || !strings.Contains(err.Error(), "final input turn") {
+		t.Fatalf("expected clear Gemini 3.6 prefill rejection, got %v", err)
+	}
+}
+
+func TestGeminiStopSequencesAreAppliedLocally(t *testing.T) {
+	converted, _, err := geminiResponseToAnthropicWithSignaturesAndStops([]byte(`{
+		"responseId":"r","modelVersion":"gemini-3.5-flash",
+		"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"before EN"},{"text":"D after"}]}}],
+		"usageMetadata":{"promptTokenCount":1,"totalTokenCount":4}
+	}`), []string{"END"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]interface{}
+	_ = json.Unmarshal(converted, &got)
+	if got["stop_reason"] != "stop_sequence" || got["stop_sequence"] != "END" {
+		t.Fatalf("stop metadata mismatch: %s", converted)
+	}
+	blocks := got["content"].([]interface{})
+	combined := ""
+	for _, raw := range blocks {
+		combined += raw.(map[string]interface{})["text"].(string)
+	}
+	if combined != "before " {
+		t.Fatalf("unexpected truncated text %q", combined)
+	}
+}
+
+func TestGeminiStreamingStopSequenceAcrossEvents(t *testing.T) {
+	authSrv := newStaticAuthServer(t)
+	defer authSrv.Close()
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"before EN\"}]}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"D after\"}]}}]}\n\n"))
+	}))
+	defer gateway.Close()
+
+	s, _ := NewServer(geminiTestConfig(gateway.URL, authSrv.URL))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"stream":true,"stop_sequences":["END"],"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, want := range []string{`"text":"before "`, `"stop_reason":"stop_sequence"`, `"stop_sequence":"END"`, `"id":"msg_gemini_`, `"model":"gemini-3.5-flash"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream response missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "after") {
+		t.Fatalf("stream leaked text after stop sequence: %s", body)
+	}
+}
+
+func TestGeminiRejectsUnsupportedToolSemantics(t *testing.T) {
+	base := `{"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"read_file","input_schema":{"type":"object"}}],`
+	for _, suffix := range []string{
+		`"tool_choice":{"type":"auto","disable_parallel_tool_use":true}}`,
+		`"container":{"id":"container_1"}}`,
+		`"tools":"not-an-array"}`,
+	} {
+		if _, err := anthropicMessagesToGemini([]byte(base + suffix)); err == nil {
+			t.Fatalf("expected request to be rejected: %s", suffix)
+		}
+	}
+	converted, err := anthropicMessagesToGemini([]byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"name":"BatchTool","input_schema":{"type":"object"}},
+			{"name":"read_file","input_schema":{"type":"object"}}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(converted, []byte("BatchTool")) || !bytes.Contains(converted, []byte("read_file")) {
+		t.Fatalf("legacy BatchTool filtering mismatch: %s", converted)
+	}
+}
+
+func TestSignatureStoreIsSessionScopedAndBounded(t *testing.T) {
+	store := newSignatureStore(time.Hour, 2, 1)
+	store.remember("session-a", map[string]string{"tool:1": "sig-a", "tool:2": "sig-b"})
+	store.remember("session-b", map[string]string{"tool:1": "sig-other"})
+	if got := store.snapshot("session-b")["tool:1"]; got != "sig-other" {
+		t.Fatalf("session isolation failed: %q", got)
+	}
+	if got := store.snapshot("session-a"); len(got) != 1 {
+		t.Fatalf("per-session bound failed: %#v", got)
+	}
+	if got := store.snapshot(""); got != nil {
+		t.Fatalf("anonymous requests must not share signatures: %#v", got)
+	}
+}
+
+func TestMalformedGeminiStreamEmitsAnthropicError(t *testing.T) {
+	authSrv := newStaticAuthServer(t)
+	defer authSrv.Close()
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {not-json}\n\n"))
+	}))
+	defer gateway.Close()
+	s, _ := NewServer(geminiTestConfig(gateway.URL, authSrv.URL))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") || strings.Contains(body, "event: message_stop") {
+		t.Fatalf("malformed stream must terminate with an error event: %s", body)
 	}
 }
 
@@ -311,7 +490,7 @@ func TestGeminiCountTokens(t *testing.T) {
 	defer authSrv.Close()
 
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-3.5-flash:countTokens" {
+		if r.URL.Path != "/v1/projects/p/locations/global/publishers/google/models/gemini-3.5-flash:countTokens" {
 			t.Fatalf("unexpected countTokens path: %s", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -356,7 +535,7 @@ func geminiTestConfig(gatewayURL, authURL string) Config {
 		GatewayBaseURL:   gatewayURL,
 		VertexAPIFormat:  "gemini",
 		Project:          "p",
-		Location:         "us-central1",
+		Location:         "global",
 		Publisher:        "google",
 		Model:            "gemini-3.5-flash",
 		ModelOverride:    true,
