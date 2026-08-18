@@ -247,7 +247,7 @@ func (s *Server) rewriteRequestForVertex(body []byte, parsed messagesRequest, se
 		return nil, "", false, "", err
 	}
 	if s.cfg.VertexAPIFormat == "gemini" {
-		if err := validateGeminiModelLocation(targetModel, s.cfg.Location); err != nil {
+		if err := validateGeminiModel(targetModel); err != nil {
 			return nil, "", false, "", err
 		}
 	}
@@ -340,7 +340,7 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if err := validateGeminiModelLocation(targetModel, s.cfg.Location); err != nil {
+	if err := validateGeminiModel(targetModel); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}

@@ -136,7 +136,7 @@ func LoadConfigFromEnv() (Config, error) {
 		}
 	}
 	if cfg.VertexAPIFormat == "gemini" {
-		if err := validateGeminiModelLocation(cfg.Model, cfg.Location); err != nil {
+		if err := validateGeminiModel(cfg.Model); err != nil {
 			return Config{}, err
 		}
 	}
@@ -242,25 +242,11 @@ func validateVertexResourceSegment(name, value string) error {
 	return nil
 }
 
-func validateGeminiModelLocation(model, location string) error {
+func validateGeminiModel(model string) error {
 	if !strings.HasPrefix(model, "gemini-") {
 		return fmt.Errorf("VERTEX_API_FORMAT=gemini requires a Gemini model, got %q", model)
 	}
-	switch model {
-	case "gemini-3.6-flash":
-		if location != "global" {
-			return errors.New("gemini-3.6-flash requires VERTEX_LOCATION=global")
-		}
-	case "gemini-3.5-flash":
-		allowed := map[string]bool{
-			"global": true, "us": true, "eu": true,
-			"northamerica-northeast1": true, "europe-west2": true, "europe-west3": true,
-			"asia-northeast1": true, "asia-south1": true, "asia-southeast1": true,
-		}
-		if !allowed[location] {
-			return fmt.Errorf("gemini-3.5-flash is not available for online prediction in location %q", location)
-		}
-	case "gemini-3.7-flash":
+	if model == "gemini-3.7-flash" {
 		return errors.New("gemini-3.7-flash is not a published Vertex model")
 	}
 	return nil

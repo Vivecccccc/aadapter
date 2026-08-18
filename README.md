@@ -119,7 +119,7 @@ export VERTEX_LOCATION=global
 export VERTEX_PUBLISHER=google
 ```
 
-For Gemini 3.6 Flash, `VERTEX_LOCATION=global` is required. `gemini-3.7-flash` is not a published Vertex model and is rejected at startup.
+The adapter does not enforce model-specific Vertex region restrictions; `VERTEX_LOCATION` is forwarded as configured so gateway-specific routing can be used. `gemini-3.7-flash` is not a published Vertex model and is rejected at startup.
 
 ## Claude Code 2.1.88
 

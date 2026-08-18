@@ -21,7 +21,7 @@ func TestGeminiProductionConfigurationValidation(t *testing.T) {
 		t.Setenv("ALLOW_UNAUTHENTICATED", "false")
 	}
 
-	t.Run("Gemini 3.6 global is accepted", func(t *testing.T) {
+	t.Run("Gemini 3.6 is accepted", func(t *testing.T) {
 		setRequired(t)
 		cfg, err := LoadConfigFromEnv()
 		if err != nil {
@@ -32,12 +32,15 @@ func TestGeminiProductionConfigurationValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid location is explicit", func(t *testing.T) {
+	t.Run("Gemini location is not restricted", func(t *testing.T) {
 		setRequired(t)
 		t.Setenv("VERTEX_LOCATION", "us-central1")
-		_, err := LoadConfigFromEnv()
-		if err == nil || !strings.Contains(err.Error(), "requires VERTEX_LOCATION=global") {
-			t.Fatalf("unexpected error: %v", err)
+		cfg, err := LoadConfigFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Location != "us-central1" {
+			t.Fatalf("unexpected location: %q", cfg.Location)
 		}
 	})
 
