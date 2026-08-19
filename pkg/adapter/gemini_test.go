@@ -124,6 +124,78 @@ func TestGeminiToolResultAndToolUseMapping(t *testing.T) {
 	}
 }
 
+func TestGeminiToolResultFoldsSupplementalContent(t *testing.T) {
+	imageData := "iVBORw0KGgo="
+	for _, tc := range []struct {
+		name     string
+		messages string
+	}{
+		{
+			name: "same user message",
+			messages: `
+				{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Skill","input":{}}]},
+				{"role":"user","content":[
+					{"type":"tool_result","tool_use_id":"call_1","content":[
+						{"type":"text","text":"Launching skill: keybindings-help"},
+						{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + imageData + `"}}
+					]},
+					{"type":"text","text":"# Keybindings Skill"},
+					{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + imageData + `"}}
+				]}`,
+		},
+		{
+			name: "adjacent user message",
+			messages: `
+				{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Skill","input":{}}]},
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"Launching skill: keybindings-help"}]},
+				{"role":"user","content":[{"type":"text","text":"# Keybindings Skill"}]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rewritten, err := anthropicMessagesToGemini([]byte(`{"messages":[` + tc.messages + `]}`))
+			if err != nil {
+				t.Fatalf("rewrite failed: %v", err)
+			}
+			var got map[string]interface{}
+			_ = json.Unmarshal(rewritten, &got)
+			contents := got["contents"].([]interface{})
+			userParts := contents[1].(map[string]interface{})["parts"].([]interface{})
+			if len(userParts) != 1 {
+				t.Fatalf("tool response turn must only contain functionResponse parts: %s", rewritten)
+			}
+			response := userParts[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
+			output := response["response"].(map[string]interface{})["output"]
+			if output != "Launching skill: keybindings-help\n\n# Keybindings Skill" {
+				t.Fatalf("supplemental text was not folded: %s", rewritten)
+			}
+			if tc.name == "same user message" {
+				mediaParts := response["parts"].([]interface{})
+				if len(mediaParts) != 2 {
+					t.Fatalf("expected nested and supplemental media parts: %s", rewritten)
+				}
+				inline := mediaParts[0].(map[string]interface{})["inlineData"].(map[string]interface{})
+				if inline["mimeType"] != "image/png" || inline["data"] != imageData {
+					t.Fatalf("supplemental media was not folded: %s", rewritten)
+				}
+			}
+		})
+	}
+}
+
+func TestGeminiToolResultRejectsUnsupportedFunctionResponseMedia(t *testing.T) {
+	_, err := anthropicMessagesToGemini([]byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"fetch_image","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/gif","data":"R0lGODlh"}}
+			]}]}
+		]
+	}`))
+	if err == nil || !strings.Contains(err.Error(), `unsupported Gemini function response MIME type "image/gif"`) {
+		t.Fatalf("expected explicit unsupported MIME error, got %v", err)
+	}
+}
+
 func TestGeminiToolUseResponsePreservesThoughtSignature(t *testing.T) {
 	converted, err := geminiResponseToAnthropic([]byte(`{
 		"responseId":"resp_tool",

@@ -106,6 +106,8 @@ So if `GATEWAY_BASE_URL=https://gateway.example.com`, final forwarded URL is lik
 - `tool_choice.disable_parallel_tool_use=true` and Anthropic `container` execution are rejected because Vertex Gemini cannot preserve those semantics
 - `output_config.effort` maps to Gemini `generationConfig.thinkingConfig.thinkingLevel` (`low`, `medium`, `high`, `max`, and Claude Code `xhigh` are handled explicitly)
 - Gemini thought signatures are carried in valid `redacted_thinking` blocks and also kept in a bounded cache isolated by Claude Code's `X-Claude-Code-Session-Id`
+- Text or media that Claude Code appends after tool results (for example Skill bodies, hook context, or nested project rules) is folded into the corresponding Gemini `functionResponse`
+- Multimodal tool results use Gemini `functionResponse.parts` and reject MIME types outside the supported image/PDF/plain-text set before forwarding
 - `stop_sequences` are enforced locally so the Anthropic response contains the exact matching `stop_sequence`
 - Gemini 3.5 preserves supported `temperature`/`top_p` controls but omits its fixed `top_k`; Gemini 3.6 omits custom sampling controls that it ignores
 

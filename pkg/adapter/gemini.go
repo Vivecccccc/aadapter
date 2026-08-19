@@ -240,7 +240,14 @@ func buildGeminiContents(src map[string]interface{}, signatures map[string]strin
 			previous, _ := contents[len(contents)-1].(map[string]interface{})
 			if previous != nil && previous["role"] == geminiRole {
 				previousParts, _ := previous["parts"].([]interface{})
-				previous["parts"] = append(previousParts, parts...)
+				mergedParts := append(previousParts, parts...)
+				if geminiRole == "user" {
+					mergedParts, err = foldGeminiFunctionResponseSupplements(mergedParts)
+					if err != nil {
+						return nil, err
+					}
+				}
+				previous["parts"] = mergedParts
 				continue
 			}
 		}
@@ -345,10 +352,83 @@ func convertAnthropicContentToGeminiParts(content interface{}, role string, tool
 				return nil, fmt.Errorf("unsupported Anthropic content block for Gemini conversion: %s", blockType)
 			}
 		}
+		if role == "user" {
+			return foldGeminiFunctionResponseSupplements(parts)
+		}
 		return parts, nil
 	default:
 		return nil, fmt.Errorf("message content must be a string or array")
 	}
+}
+
+func foldGeminiFunctionResponseSupplements(parts []interface{}) ([]interface{}, error) {
+	var folded []interface{}
+	var lastResponse map[string]interface{}
+	seenSupplement := false
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("Gemini content parts must be objects")
+		}
+		if rawResponse, ok := part["functionResponse"]; ok {
+			if seenSupplement {
+				return nil, fmt.Errorf("tool_result blocks must precede supplemental content in a user message")
+			}
+			if lastResponse == nil && len(folded) > 0 {
+				return nil, fmt.Errorf("tool_result blocks must precede supplemental content in a user message")
+			}
+			response, ok := rawResponse.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("Gemini functionResponse must be an object")
+			}
+			folded = append(folded, part)
+			lastResponse = response
+			continue
+		}
+		if lastResponse == nil {
+			folded = append(folded, part)
+			continue
+		}
+		seenSupplement = true
+		switch {
+		case part["text"] != nil:
+			text, ok := part["text"].(string)
+			if !ok {
+				return nil, fmt.Errorf("Gemini text part must contain a string")
+			}
+			appendGeminiFunctionResponseText(lastResponse, text)
+		case part["inlineData"] != nil || part["fileData"] != nil:
+			if err := validateGeminiFunctionResponseMediaPart(part); err != nil {
+				return nil, err
+			}
+			mediaParts, _ := lastResponse["parts"].([]interface{})
+			lastResponse["parts"] = append(mediaParts, part)
+		default:
+			return nil, fmt.Errorf("unsupported supplemental part after tool_result")
+		}
+	}
+	return folded, nil
+}
+
+func appendGeminiFunctionResponseText(functionResponse map[string]interface{}, supplemental string) {
+	if supplemental == "" {
+		return
+	}
+	response, _ := functionResponse["response"].(map[string]interface{})
+	if response == nil {
+		response = map[string]interface{}{}
+		functionResponse["response"] = response
+	}
+	key := "output"
+	if _, ok := response["error"]; ok {
+		key = "error"
+	}
+	existing, _ := response[key].(string)
+	if existing == "" {
+		response[key] = supplemental
+		return
+	}
+	response[key] = existing + "\n\n" + supplemental
 }
 
 func anthropicMediaBlockToGeminiPart(block map[string]interface{}, blockType string) (map[string]interface{}, error) {
@@ -1382,6 +1462,9 @@ func normalizeToolResult(block map[string]interface{}) (map[string]interface{}, 
 				if err != nil {
 					return nil, nil, err
 				}
+				if err := validateGeminiFunctionResponseMediaPart(part); err != nil {
+					return nil, nil, err
+				}
 				if inline, ok := part["inlineData"]; ok {
 					mediaParts = append(mediaParts, map[string]interface{}{"inlineData": inline})
 				} else if file, ok := part["fileData"]; ok {
@@ -1404,6 +1487,24 @@ func normalizeToolResult(block map[string]interface{}) (map[string]interface{}, 
 		return nil, nil, fmt.Errorf("tool_result content must be a string or content block array")
 	}
 	return map[string]interface{}{responseKey: content}, mediaParts, nil
+}
+
+func validateGeminiFunctionResponseMediaPart(part map[string]interface{}) error {
+	var data map[string]interface{}
+	if inline, ok := part["inlineData"].(map[string]interface{}); ok {
+		data = inline
+	} else if file, ok := part["fileData"].(map[string]interface{}); ok {
+		data = file
+	} else {
+		return nil
+	}
+	mimeType, _ := data["mimeType"].(string)
+	switch mimeType {
+	case "image/png", "image/jpeg", "image/webp", "application/pdf", "text/plain":
+		return nil
+	default:
+		return fmt.Errorf("unsupported Gemini function response MIME type %q", mimeType)
+	}
 }
 
 func objectOrEmpty(value interface{}) interface{} {
